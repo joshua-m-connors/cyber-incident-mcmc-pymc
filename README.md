@@ -6,6 +6,10 @@ It then simulates each attack as it progresses through the relevant MITRE ATT&CK
 
 The result is then an posterior projection of the number of successful attacks that will actually get through the entire attack process.
 
+Requires:
+- Python
+- PyMC
+
 Sample Output:
 
 <img width="1296" height="706" alt="Screenshot From 2025-10-25 15-49-40" src="https://github.com/user-attachments/assets/f3d1e7ae-06d7-489e-bd02-cf57800c9590" />
