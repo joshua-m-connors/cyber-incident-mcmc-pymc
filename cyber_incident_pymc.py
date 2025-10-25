@@ -1,377 +1,426 @@
-import pymc as pm
+# cyber_incident_pymc_fair_full_tail.py
+"""
+Full FAIR-style AAL model with:
+ - Poisson arrival (lambda) for attempts
+ - Per-stage Beta priors; overall per-attempt success = product(stage success)
+ - Posterior predictive compound-Poisson for annual loss:
+    - Per-incident latent severity multiplier -> induces correlation across categories
+    - Primary categories: LogNormal magnitude * severity
+    - Secondary categories (Regulatory, Reputation): Bernoulli-triggered; when triggered
+         draw from LogNormal (body) with prob (1 - tail_prob) OR Pareto (tail) with prob tail_prob
+ - Saves posterior predictive draws and category breakdown to CSV.
+"""
 import numpy as np
-import matplotlib.pyplot as plt
+import pymc as pm
 import arviz as az
-from scipy import stats
+import matplotlib.pyplot as plt
+from scipy import stats, optimize
+import pandas as pd
 
-# Set random seed for reproducibility
 np.random.seed(42)
 
-# ============================================================================
-# USER INPUTS: 90% Confidence Interval for attack frequency/probability
-# ============================================================================
-# Frequency: expected number of successful attacks per year
-CI_MIN_FREQ = 2      # Minimum frequency - 5th percentile (attacks/year)
-CI_MAX_FREQ = 24     # Maximum frequency - 95th percentile (attacks/year)
+# -----------------------
+# User priors / setup
+# -----------------------
+CI_MIN_FREQ = 2
+CI_MAX_FREQ = 24
+Z_90 = 1.645
 
-print("="*70)
-print("MITRE ATT&CK-Based Cybersecurity Incident Probability Model")
-print("="*70)
-print(f"\nUser-defined 90% CI: [{CI_MIN_FREQ}, {CI_MAX_FREQ}] attacks/year")
+# ------------------------------------------------------------
+# USER INPUT: MITRE ATT&CK STAGES AND CONTROL EFFECTIVENESS
+# ------------------------------------------------------------
+# Define each stage as a dictionary entry.
+# The keys are the MITRE stage names (in attack flow order),
+# and the values are tuples for estimated CONTROL EFFECTIVENESS (min, max).
+#
+# Control effectiveness means: fraction of attacks stopped by controls at that stage.
+# For example, (0.15, 0.50) means controls block 15–50% of attempts at that stage.
+#
+# You can comment out stages not relevant to your model,
+# or adjust the min/max numbers as your organization’s data evolves.
+#
+# The model automatically:
+#   - infers attacker success rates = (1 - control effectiveness)
+#   - validates that min < max and values ∈ [0, 1]
+# ------------------------------------------------------------
 
-# Convert frequency to time between attacks (in days)
-# Higher frequency = shorter time between attacks
-CI_MIN_TIME = 365 / CI_MAX_FREQ  # Min time corresponds to max frequency
-CI_MAX_TIME = 365 / CI_MIN_FREQ  # Max time corresponds to min frequency
+STAGE_CONTROL_MAP = {
+    "Initial Access":        (0.15, 0.50),
+    "Execution":             (0.05, 0.30),
+    "Persistence":           (0.10, 0.45),
+    "Privilege Escalation":  (0.10, 0.35),
+    "Defense Evasion":       (0.20, 0.60),
+    "Credential Access":     (0.15, 0.50),
+    "Discovery":             (0.02, 0.20),
+    "Lateral Movement":      (0.25, 0.65),
+    "Collection":            (0.05, 0.30),
+    "Command and Control":   (0.10, 0.45),
+    "Exfiltration":          (0.30, 0.70),
+    "Impact":                (0.35, 0.75),
+}
 
-print(f"Converted to time between attacks: [{CI_MIN_TIME:.2f}, {CI_MAX_TIME:.2f}] days")
+# Validate and extract into lists
+MITRE_STAGES = list(STAGE_CONTROL_MAP.keys())
+stage_control_effectiveness = []
 
-# Calculate lognormal parameters from 90% CI
-# For lognormal: P5 = exp(mu - 1.645*sigma), P95 = exp(mu + 1.645*sigma)
-z_score = 1.645  # For 90% CI (5th and 95th percentiles)
-
-# Solve for mu and sigma
-sigma_initial = (np.log(CI_MAX_TIME) - np.log(CI_MIN_TIME)) / (2 * z_score)
-mu_initial = (np.log(CI_MAX_TIME) + np.log(CI_MIN_TIME)) / 2
-
-print(f"\nCalculated lognormal parameters from CI:")
-print(f"  μ (log-scale mean): {mu_initial:.4f}")
-print(f"  σ (log-scale std): {sigma_initial:.4f}")
-print(f"  Median time to attack: {np.exp(mu_initial):.2f} days")
-print(f"  Median attack frequency: {365/np.exp(mu_initial):.2f} attacks/year")
-
-# ============================================================================
-# MITRE ATT&CK Framework Stages
-# ============================================================================
-MITRE_STAGES = [
-    "Initial Access",
-    "Execution", 
-    "Persistence",
-    "Privilege Escalation",
-    "Defense Evasion",
-    "Credential Access",
-    "Discovery",
-    "Lateral Movement",
-    "Collection",
-    "Command and Control",
-    "Exfiltration",
-    "Impact"
-]
+for stage, eff in STAGE_CONTROL_MAP.items():
+    if not (isinstance(eff, (list, tuple)) and len(eff) == 2):
+        raise ValueError(f"Stage '{stage}' must have a (min,max) tuple for control effectiveness.")
+    low, high = eff
+    if not (0 <= low < high <= 1):
+        raise ValueError(f"Stage '{stage}' has invalid effectiveness bounds ({low}, {high}). Must be within [0,1].")
+    stage_control_effectiveness.append((low, high))
 
 NUM_STAGES = len(MITRE_STAGES)
-print(f"\nMITRE ATT&CK Stages (Total: {NUM_STAGES}):")
-for i, stage in enumerate(MITRE_STAGES, 1):
-    print(f"  {i}. {stage}")
+print(f"Loaded {NUM_STAGES} MITRE stages.")
+for i, (name, (lo, hi)) in enumerate(zip(MITRE_STAGES, stage_control_effectiveness), 1):
+    print(f"  {i:2d}. {name:<22s}  Control effectiveness: {lo:.2f}–{hi:.2f}")
 
-# ============================================================================
-# USER INPUTS: Per-Stage Control Effectiveness (90% CI)
-# ============================================================================
-# Define 90% CI for CONTROL EFFECTIVENESS per stage (0 = no protection, 1 = perfect protection)
-# Each tuple is (min_effectiveness, max_effectiveness) at 5th and 95th percentiles
-# HIGHER values = STRONGER controls, LOWER values = WEAKER controls
 
-stage_control_effectiveness = [
-    (0.15, 0.50),  # 1. Initial Access - moderate defenses (firewall, email filters)
-    (0.05, 0.30),  # 2. Execution - weak defenses, attackers often succeed
-    (0.10, 0.45),  # 3. Persistence - moderate defenses
-    (0.10, 0.35),  # 4. Privilege Escalation - moderate defenses
-    (0.20, 0.60),  # 5. Defense Evasion - strong EDR/XDR, but uncertain effectiveness
-    (0.15, 0.50),  # 6. Credential Access - moderate defenses (MFA, PAM)
-    (0.02, 0.20),  # 7. Discovery - very weak defenses, hard to prevent
-    (0.25, 0.65),  # 8. Lateral Movement - strong segmentation and monitoring
-    (0.05, 0.30),  # 9. Collection - weak defenses
-    (0.10, 0.45),  # 10. Command and Control - moderate defenses (proxy, IDS)
-    (0.30, 0.70),  # 11. Exfiltration - strong DLP and egress filtering
-    (0.35, 0.75)   # 12. Impact - strong IR, backups, and resilience
-]
+stage_success_ranges = [(1 - max_e, 1 - min_e) for (min_e, max_e) in stage_control_effectiveness]
 
-print("\n" + "="*70)
-print("Per-Stage Control Effectiveness (90% CI):")
-print("Higher values = Stronger controls | Lower values = Weaker controls")
-print("="*70)
-for i, (stage, (min_eff, max_eff)) in enumerate(zip(MITRE_STAGES, stage_control_effectiveness), 1):
-    mean_eff = (min_eff + max_eff) / 2
-    # Calculate corresponding attacker success rate
-    min_success = 1 - max_eff
-    max_success = 1 - min_eff
-    mean_success = 1 - mean_eff
-    print(f"{i:2d}. {stage:25s}: Control Eff [{min_eff:.2f}, {max_eff:.2f}] → "
-          f"Attacker Success [{min_success:.2f}, {max_success:.2f}]")
+def quantile_match_beta(p5, p95, q_low=0.05, q_high=0.95):
+    mean = 0.5 * (p5 + p95)
+    range_width = max(p95 - p5, 1e-6)
+    concentration_guess = 20.0 * (0.1 / range_width)
+    a0 = max(1e-3, mean * concentration_guess)
+    b0 = max(1e-3, (1 - mean) * concentration_guess)
+    def residuals(params):
+        a, b = params
+        if a <= 0 or b <= 0:
+            return [1e6, 1e6]
+        return [
+            stats.beta.ppf(q_low, a, b) - p5,
+            stats.beta.ppf(q_high, a, b) - p95
+        ]
+    sol = optimize.root(residuals, [a0, b0], method='hybr')
+    if sol.success and np.all(sol.x > 0):
+        return float(sol.x[0]), float(sol.x[1])
+    return float(a0), float(b0)
 
-# Convert control effectiveness to attacker success rates
-stage_success_ranges = []
-for min_eff, max_eff in stage_control_effectiveness:
-    # Attacker success = 1 - Control effectiveness
-    min_success = 1 - max_eff  # Min success when controls are most effective
-    max_success = 1 - min_eff  # Max success when controls are least effective
-    stage_success_ranges.append((min_success, max_success))
-
-# Convert CI ranges to Beta distribution parameters
-def ci_to_beta_params(min_val, max_val):
-    """
-    Convert 90% CI (5th and 95th percentiles) to Beta distribution parameters.
-    Uses method of moments approximation.
-    """
-    # Use mean and adjust concentration based on range width
-    mean = (min_val + max_val) / 2
-    
-    # Estimate concentration from range width
-    # Wider range = lower concentration (more uncertainty)
-    range_width = max_val - min_val
-    # Base concentration scaled inversely with range width
-    concentration = 15 * (0.4 / range_width)
-    
-    alpha = mean * concentration
-    beta = (1 - mean) * concentration
-    
-    return alpha, beta
-
-alphas = []
-betas = []
-
-for min_success, max_success in stage_success_ranges:
-    alpha, beta = ci_to_beta_params(min_success, max_success)
-    alphas.append(alpha)
-    betas.append(beta)
-
+alphas, betas = zip(*(quantile_match_beta(lo, hi) for lo, hi in stage_success_ranges))
 alphas = np.array(alphas)
 betas = np.array(betas)
 
-print(f"\nBeta distribution parameters calculated for attacker success rates")
+# -----------------------
+# FAIR categories
+# -----------------------
+loss_categories = [
+    "Productivity",         # primary (lognormal body)
+    "ResponseContainment",  # primary (lognormal body)
+    "RegulatoryLegal",      # secondary (zero-inflated; lognormal body + Pareto tail)
+    "ReputationCompetitive"  # secondary (zero-inflated; lognormal body + Pareto tail)
+]
+NCAT = len(loss_categories)
+# category indices
+IDX_REG = loss_categories.index("RegulatoryLegal")
+IDX_REP = loss_categories.index("ReputationCompetitive")
 
-# ============================================================================
-# Simulate observed attack progression data
-# ============================================================================
-np.random.seed(42)
+# Default 90% CI per category (Q5, Q95) - edit these to reflect your beliefs.
+loss_q5_q95 = {
+    "Productivity": (10_000, 150_000),
+    "ResponseContainment": (20_000, 500_000),
+    "RegulatoryLegal": (0, 1_000_000),        # Q5=0 means often zero; handled via zero-inflation
+    "ReputationCompetitive": (0, 2_000_000)
+}
 
-# Simulate 30 observed attack scenarios
-observed_attacks = []
-for _ in range(30):
-    attack = []
-    # Each stage has time in days (lognormal distributed)
-    for stage in range(NUM_STAGES):
-        # Sample from lognormal with slight variation per stage
-        stage_mu = mu_initial - np.log(NUM_STAGES) + np.random.normal(0, 0.1)
-        stage_sigma = sigma_initial * 0.8
-        time_in_stage = np.random.lognormal(stage_mu, stage_sigma)
-        attack.append(max(0.1, time_in_stage))  # Ensure positive
-    observed_attacks.append(attack)
+# Helper: lognormal params from Q5/Q95 (clamp q5>0)
+def lognormal_from_q5_q95(q5, q95):
+    q5 = max(q5, 1.0)
+    q95 = max(q95, q5 * 1.0001)
+    ln_q5, ln_q95 = np.log(q5), np.log(q95)
+    sigma = (ln_q95 - ln_q5) / (2 * Z_90)
+    mu = 0.5 * (ln_q5 + ln_q95)
+    return mu, sigma
 
-observed_attacks = np.array(observed_attacks)
-total_attack_times = observed_attacks.sum(axis=1)
+cat_mu = np.zeros(NCAT)
+cat_sigma = np.zeros(NCAT)
+for i, cat in enumerate(loss_categories):
+    q5, q95 = loss_q5_q95.get(cat, (1.0, 1.0))
+    mu, sigma = lognormal_from_q5_q95(q5, q95)
+    cat_mu[i] = mu
+    cat_sigma[i] = sigma
 
-print(f"\nObserved attack completion times (days):")
-print(f"  Mean: {np.mean(total_attack_times):.2f}")
-print(f"  Median: {np.median(total_attack_times):.2f}")
-print(f"  Std Dev: {np.std(total_attack_times):.2f}")
-print(f"  Min: {np.min(total_attack_times):.2f}, Max: {np.max(total_attack_times):.2f}")
+# --- heavy-tail (Pareto) defaults for Regulatory & Reputation
+# Pareto: PDF ~ alpha * xm^alpha / x^(alpha+1) for x >= xm
+pareto_defaults = {
+    "RegulatoryLegal": {"xm": 100_000.0, "alpha": 1.8, "tail_prior_a": 2.0, "tail_prior_b": 2.0},
+    "ReputationCompetitive": {"xm": 250_000.0, "alpha": 1.5, "tail_prior_a": 2.0, "tail_prior_b": 2.0}
+}
+# The above xm is a scale threshold; adjust if you expect tail events to start smaller/larger.
 
-# ============================================================================
-# Build the PyMC Model with MITRE ATT&CK stages
-# ============================================================================
-with pm.Model() as attack_progression_model:
-    # Global parameters for attack timing distribution
-    # Use user-defined CI to inform priors
-    mu_global = pm.Normal('mu_global', mu=mu_initial, sigma=0.5)
-    sigma_global = pm.HalfNormal('sigma_global', sigma=sigma_initial)
-    
-    # Stage-specific timing parameters
-    # Each stage can have different characteristics
-    stage_modifiers = pm.Normal('stage_modifiers', mu=0, sigma=0.3, 
-                                shape=NUM_STAGES)
-    
-    # Probability of successfully progressing through each stage
-    # Use stage-specific Beta priors based on user-defined control effectiveness
-    success_probs = pm.Beta('success_probs', alpha=alphas, beta=betas, 
-                           shape=NUM_STAGES)
-    
-    # For each observed attack, model the total time
-    stage_times = []
-    for i in range(NUM_STAGES):
-        # Each stage has its own lognormal distribution
-        stage_mu = mu_global + stage_modifiers[i] - np.log(NUM_STAGES)
-        stage_time = pm.Lognormal(f'stage_{i}_time', 
-                                  mu=stage_mu, 
-                                  sigma=sigma_global,
-                                  shape=len(observed_attacks))
-        stage_times.append(stage_time)
-    
-    # Total attack time is sum of all stages
-    total_time = pm.Deterministic('total_attack_time', 
-                                  sum(stage_times))
-    
-    # Likelihood: observed total attack times
-    likelihood = pm.Normal('likelihood', 
-                          mu=total_time, 
-                          sigma=2.0,  # Observation noise
-                          observed=total_attack_times)
-    
-    # Sample using MCMC
-    print("\n" + "="*70)
-    print("Running MCMC Sampling...")
-    print("="*70)
-    trace = pm.sample(2000, tune=1000, chains=4, return_inferencedata=True,
-                     progressbar=True)
+# -----------------------
+# Zero-inflation prior for secondaries (learnable)
+# Also tail probability prior for secondaries (prob of sampling Pareto vs body)
+# -----------------------
+# We'll give Beta priors with modest concentration (learn from data if you have it)
+# If you prefer to fix these, set observed_* variables below.
+# -----------------------
 
-# ============================================================================
-# Analyze Results
-# ============================================================================
-print("\n" + "="*70)
-print("MCMC Sampling Results:")
-print("="*70)
-print(az.summary(trace, var_names=['mu_global', 'sigma_global', 'success_probs']))
+# -----------------------
+# Optional observed data (set if you want to condition)
+# -----------------------
+observed_success_counts = None  # {'attempts': N, 'successes': k}
+observed_successes_per_year = 5  # int
+# If you have history of category-level incident losses, that would need a separate conditioning block.
 
-# Extract posterior samples - properly handle xarray format
-mu_samples = trace.posterior['mu_global'].values.flatten()
-sigma_samples = trace.posterior['sigma_global'].values.flatten()
+# -----------------------
+# PyMC model for frequency + per-stage success + zero-inflation/tail priors & severity priors
+# Note: We do NOT model per-incident losses inside PyMC (keeps sampling stable). We learn the
+# high-level parameters (lambda, success_probs, p_trigger, tail_prob, pareto alpha, severity prior),
+# and then run posterior predictive draws outside PyMC to generate compound-Poisson losses.
+# -----------------------
+with pm.Model() as model:
+    # Attack rate prior (lognormal matching 90% CI)
+    mu_lambda = np.log(np.sqrt(CI_MIN_FREQ * CI_MAX_FREQ))
+    sigma_lambda = (np.log(CI_MAX_FREQ) - np.log(CI_MIN_FREQ)) / (2 * Z_90)
+    lambda_rate = pm.Lognormal("lambda_rate", mu=mu_lambda, sigma=sigma_lambda)
 
-# Fix: Properly extract and flatten success_probs samples
-success_prob_samples_flat = trace.posterior['success_probs'].values.reshape(-1, NUM_STAGES)
+    # Per-stage attacker success probabilities
+    success_probs = pm.Beta("success_probs", alpha=alphas, beta=betas, shape=NUM_STAGES)
+    overall_success_prob = pm.Deterministic("overall_success_prob", pm.math.prod(success_probs))
 
-# Calculate overall attack success probability
-# Attack succeeds only if all stages are completed
-overall_success = np.prod(success_prob_samples_flat, axis=1)
+    expected_successes = pm.Deterministic("expected_successes", lambda_rate * overall_success_prob)
 
-print("\n" + "="*70)
-print("Attack Success Probability (completing all MITRE stages):")
-print("="*70)
-print(f"Mean probability: {np.mean(overall_success):.4f} ({np.mean(overall_success)*100:.2f}%)")
-print(f"95% Credible Interval: [{np.percentile(overall_success, 2.5):.4f}, "
-      f"{np.percentile(overall_success, 97.5):.4f}]")
+    # Zero-inflation trigger probability for secondaries (Regulatory & Reputation)
+    # Use Beta priors: e.g. many years no fine -> expect low p_trigger but allow learning
+    p_trigger_reg = pm.Beta("p_trigger_reg", alpha=1.5, beta=6.0)   # prior mean ~0.2
+    p_trigger_rep = pm.Beta("p_trigger_rep", alpha=1.0, beta=4.0)   # prior mean ~0.2
 
-# Show expected successful attacks per year
-expected_successes = np.mean(overall_success) * np.mean([CI_MIN_FREQ, CI_MAX_FREQ])
-print(f"\nExpected successful attacks per year: {expected_successes:.2f}")
-print(f"  (Based on mean attempt frequency of {np.mean([CI_MIN_FREQ, CI_MAX_FREQ]):.1f} attacks/year)")
+    # Tail probability (prob that a triggered secondary event falls in the Pareto tail)
+    tail_prob_reg = pm.Beta("tail_prob_reg", alpha=1.0, beta=9.0)   # prior mean ~0.1 (rare tails)
+    tail_prob_rep = pm.Beta("tail_prob_rep", alpha=1.0, beta=9.0)
 
-# Calculate probability of successful attack within specific timeframes
-timeframes = [10, 20, 30, 45, 60]
-print("\n" + "="*70)
-print("Probability of Successful Attack within Timeframe:")
-print("="*70)
+    # Pareto shape (alpha) priors - smaller alpha => heavier tail
+    pareto_alpha_reg = pm.Gamma("pareto_alpha_reg", alpha=2.0, beta=1.0)   # mean 2
+    pareto_alpha_rep = pm.Gamma("pareto_alpha_rep", alpha=1.8, beta=1.0)   # mean ~1.8
 
-for threshold_days in timeframes:
-    probabilities = []
-    for mu_val, sigma_val, success_val in zip(mu_samples, sigma_samples, overall_success):
-        # Time probability * Success probability
-        time_prob = stats.lognorm.cdf(threshold_days, s=sigma_val, scale=np.exp(mu_val))
-        prob = time_prob * success_val
-        probabilities.append(prob)
-    
-    probabilities = np.array(probabilities)
-    print(f"{threshold_days:3d} days: {np.mean(probabilities):.4f} "
-          f"(95% CI: [{np.percentile(probabilities, 2.5):.4f}, "
-          f"{np.percentile(probabilities, 97.5):.4f}])")
+    # Pareto xm (scale) - fixed to defaults here but could be learned with priors if desired.
+    pareto_xm_reg = pareto_defaults["RegulatoryLegal"]["xm"]
+    pareto_xm_rep = pareto_defaults["ReputationCompetitive"]["xm"]
 
-# ============================================================================
-# Visualization
-# ============================================================================
-fig = plt.figure(figsize=(18, 14))
-gs = fig.add_gridspec(4, 3, hspace=0.35, wspace=0.3)
+    # Severity multiplier prior: per-incident latent multiplier (lognormal parameters)
+    # We'll learn population-level severity_mu and severity_sigma (in log-space)
+    severity_mu = pm.Normal("severity_mu", mu=0.0, sigma=1.0)   # multiplicative factor median = exp(mu)
+    severity_sigma = pm.HalfNormal("severity_sigma", sigma=1.0)
 
-# Plot 1: Global parameters trace
-ax1 = fig.add_subplot(gs[0, 0])
-ax1.plot(mu_samples, alpha=0.5, linewidth=0.5)
-ax1.set_title('Trace: μ_global', fontweight='bold')
-ax1.set_xlabel('Sample')
-ax1.set_ylabel('μ')
-ax1.grid(alpha=0.3)
+    # Optionally condition on observed aggregated success data
+    if observed_success_counts is not None:
+        attempts = int(observed_success_counts["attempts"])
+        successes = int(observed_success_counts["successes"])
+        pm.Binomial("obs_stage_aggregate", n=attempts, p=overall_success_prob, observed=successes)
 
-ax2 = fig.add_subplot(gs[0, 1])
-ax2.plot(sigma_samples, alpha=0.5, linewidth=0.5)
-ax2.set_title('Trace: σ_global', fontweight='bold')
-ax2.set_xlabel('Sample')
-ax2.set_ylabel('σ')
-ax2.grid(alpha=0.3)
+    if observed_successes_per_year is not None:
+        pm.Poisson("obs_successes_year", mu=expected_successes, observed=int(observed_successes_per_year))
 
-# Plot 2: Posterior distributions
-ax3 = fig.add_subplot(gs[0, 2])
-ax3.hist(mu_samples, bins=50, alpha=0.7, color='blue', edgecolor='black')
-ax3.axvline(np.mean(mu_samples), color='red', linestyle='--', 
-           label=f'Mean: {np.mean(mu_samples):.3f}')
-ax3.set_title('Posterior: μ_global', fontweight='bold')
-ax3.set_xlabel('μ')
-ax3.legend()
-ax3.grid(alpha=0.3)
+    # Sample posterior
+    trace = pm.sample(2000, tune=1000, chains=4, target_accept=0.92, return_inferencedata=True)
 
-# Plot 3: Stage success probabilities with prior ranges
-ax4 = fig.add_subplot(gs[1, :])
+# -----------------------
+# Posterior extraction
+# -----------------------
+posterior = trace.posterior
+lambda_draws = posterior["lambda_rate"].values.reshape(-1)
+p_overall_draws = posterior["overall_success_prob"].values.reshape(-1)
+p_trigger_reg_draws = posterior["p_trigger_reg"].values.reshape(-1)
+p_trigger_rep_draws = posterior["p_trigger_rep"].values.reshape(-1)
+tail_prob_reg_draws = posterior["tail_prob_reg"].values.reshape(-1)
+tail_prob_rep_draws = posterior["tail_prob_rep"].values.reshape(-1)
+pareto_alpha_reg_draws = posterior["pareto_alpha_reg"].values.reshape(-1)
+pareto_alpha_rep_draws = posterior["pareto_alpha_rep"].values.reshape(-1)
+severity_mu_draws = posterior["severity_mu"].values.reshape(-1)
+severity_sigma_draws = posterior["severity_sigma"].values.reshape(-1)
 
-# Calculate statistics using flattened samples
-stage_means = np.mean(success_prob_samples_flat, axis=0)
-stage_lower = np.percentile(success_prob_samples_flat, 2.5, axis=0)
-stage_upper = np.percentile(success_prob_samples_flat, 97.5, axis=0)
+R = len(lambda_draws)
+print(f"Posterior draws available: {R}")
 
-x_pos = np.arange(NUM_STAGES)
+# -----------------------
+# Posterior-predictive compound-Poisson with decomposition, severity, zero-inflation, heavy tail
+# For each posterior draw i:
+#   lam_eff = lambda_draws[i] * p_overall_draws[i]
+#   N_i ~ Poisson(lam_eff)
+#   For each incident j=1..N_i:
+#       severity_j ~ LogNormal(severity_mu_draws[i], severity_sigma_draws[i])
+#       For each category c:
+#           - if primary: draw from LogNormal(cat_mu[c], cat_sigma[c]) * severity_j
+#           - if secondary (Reg/Rep): Bernoulli(trigger ~ p_trigger_*) -> if triggered:
+#                 with prob tail_prob_* -> draw Pareto(xm, alpha) * severity_j
+#                 else -> draw LogNormal(cat_mu[c], cat_sigma[c]) * severity_j
+# Sum across incidents to get annual totals and per-category totals.
+# -----------------------
+annual_losses = np.zeros(R)
+incident_counts = np.zeros(R, dtype=int)
+cat_loss_matrix = np.zeros((R, NCAT))
 
-# Plot prior ranges as shaded regions (attacker success rate)
-for i, (min_success, max_success) in enumerate(stage_success_ranges):
-    ax4.axhspan(min_success, max_success, xmin=(i-0.4)/NUM_STAGES, xmax=(i+0.4)/NUM_STAGES,
-               alpha=0.2, color='gray', zorder=1)
+# Helper: draw from Pareto with parameters xm and alpha: returns values >= xm
+# numpy.random.pareto draws values with PDF ~ alpha * (1 + x)^(-alpha-1) for x>=0 (standard Pareto type I)
+# To obtain X ~ Pareto(xm, alpha): X = xm * (1 + U) where U ~ pareto(alpha)
+def draw_pareto(xm, alpha, size=1):
+    # numpy pareto -> returns samples of the "standard" pareto variable Y with pdf alpha*y^(-alpha-1), y>=1
+    # Actually numpy.random.pareto returns samples from a distribution with pdf alpha*(1+x)^(-alpha-1), x>=0
+    # so standard Pareto (x >= xm): X = xm * (1 + numpy.random.pareto(alpha))
+    return xm * (1.0 + np.random.pareto(alpha, size=size))
 
-# Plot posterior estimates
-bars = ax4.bar(x_pos, stage_means, alpha=0.8, edgecolor='black', zorder=2)
-ax4.errorbar(x_pos, stage_means, 
-            yerr=[stage_means - stage_lower, stage_upper - stage_means],
-            fmt='none', ecolor='red', capsize=5, linewidth=2, zorder=3)
+for i in range(R):
+    lam_eff = lambda_draws[i] * p_overall_draws[i]
+    # sample number of successful incidents this year
+    n_succ = np.random.poisson(lam_eff)
+    incident_counts[i] = n_succ
+    if n_succ == 0:
+        annual_losses[i] = 0.0
+        # cat_loss_matrix row stays zeros
+        continue
 
-# Color bars based on success rate (red=high success, green=low success)
-for i, bar in enumerate(bars):
-    bar.set_color(plt.cm.RdYlGn_r(stage_means[i]))
+    # sample per-incident severity multipliers
+    sev_mu = severity_mu_draws[i]
+    sev_sigma = severity_sigma_draws[i]
+    # severity_j ~ LogNormal(sev_mu, sev_sigma)
+    severities = np.random.lognormal(mean=sev_mu, sigma=sev_sigma, size=n_succ)
 
-ax4.set_xlabel('MITRE ATT&CK Stage', fontweight='bold', fontsize=11)
-ax4.set_ylabel('Attacker Success Probability', fontweight='bold', fontsize=11)
-ax4.set_title('Stage-wise Attacker Success Probabilities\n(Gray boxes = prior 90% CI, Bars = posterior mean, Red lines = posterior 95% CI)', 
-              fontweight='bold', fontsize=12)
-ax4.set_xticks(x_pos)
-ax4.set_xticklabels(range(1, NUM_STAGES + 1))
-ax4.set_ylim([0, 1])
-ax4.grid(axis='y', alpha=0.3, zorder=0)
+    # accumulate loss totals by category for this posterior draw
+    total_by_cat = np.zeros(NCAT)
 
-# Plot 4: Stage names reference with BOTH control effectiveness and attacker success
-ax5 = fig.add_subplot(gs[2, :])
-ax5.axis('off')
-stage_text = "MITRE ATT&CK Stages:\n"
-stage_text += "Control Effectiveness = Higher is better | Attacker Success = Lower is better\n"
-stage_text += "-" * 90 + "\n"
-for i, stage in enumerate(MITRE_STAGES, 1):
-    min_eff, max_eff = stage_control_effectiveness[i-1]
-    mean_eff = (min_eff + max_eff) / 2
-    mean_success = stage_means[i-1]
-    stage_text += f"{i:2d}. {stage:25s} | Control: [{min_eff:.2f}, {max_eff:.2f}] ({mean_eff:.2f}) | "
-    stage_text += f"Attack Success: {mean_success:.3f}\n"
-ax5.text(0.05, 0.95, stage_text, transform=ax5.transAxes, 
-        fontsize=9, verticalalignment='top', fontfamily='monospace',
-        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+    # Primary categories: Productivity, ResponseContainment -> always present (lognormal body scaled by severity)
+    for c_idx, cat in enumerate(loss_categories):
+        if cat in ("Productivity", "ResponseContainment"):
+            # draw n_succ lognormal magnitudes and scale by severities
+            body_draws = np.random.lognormal(mean=cat_mu[c_idx], sigma=cat_sigma[c_idx], size=n_succ)
+            total_by_cat[c_idx] = np.sum(body_draws * severities)
 
-# Plot 5: Overall attack success probability
-ax6 = fig.add_subplot(gs[3, 0])
-ax6.hist(overall_success, bins=50, alpha=0.7, color='darkred', edgecolor='black')
-ax6.axvline(np.mean(overall_success), color='yellow', linestyle='--', linewidth=2,
-           label=f'Mean: {np.mean(overall_success):.4f}')
-ax6.set_title('Overall Attack Success\nProbability', fontweight='bold')
-ax6.set_xlabel('Probability')
-ax6.set_ylabel('Frequency')
-ax6.legend()
-ax6.grid(alpha=0.3)
+    # Secondary categories handling (Regulatory & Reputation)
+    # Regulatory
+    p_trig_r = p_trigger_reg_draws[i]
+    p_tail_r = tail_prob_reg_draws[i]
+    alpha_r = max(0.1, pareto_alpha_reg_draws[i])  # avoid degenerate alpha <= 0
+    xm_r = pareto_xm_reg
+    # Reputation
+    p_trig_rep = p_trigger_rep_draws[i]
+    p_tail_rep = tail_prob_rep_draws[i]
+    alpha_rep = max(0.1, pareto_alpha_rep_draws[i])
+    xm_rep = pareto_xm_rep
 
-# Plot 6: Attack time distribution
-ax7 = fig.add_subplot(gs[3, 1:])
-total_time_samples = trace.posterior['total_attack_time'].values.flatten()
-ax7.hist(total_time_samples, bins=50, alpha=0.7, color='green', edgecolor='black')
-ax7.axvline(np.mean(total_time_samples), color='red', linestyle='--', linewidth=2,
-           label=f'Mean: {np.mean(total_time_samples):.2f} days')
-ax7.axvline(CI_MIN_TIME, color='orange', linestyle=':', linewidth=2, label='User 90% CI')
-ax7.axvline(CI_MAX_TIME, color='orange', linestyle=':', linewidth=2)
-ax7.set_title('Total Attack Completion Time Distribution', fontweight='bold')
-ax7.set_xlabel('Time (days)', fontweight='bold')
-ax7.set_ylabel('Frequency')
-ax7.legend()
-ax7.grid(alpha=0.3)
+    # Regulatory: for each incident decide trigger and sample accordingly
+    triggers_r = np.random.rand(n_succ) < p_trig_r
+    if triggers_r.any():
+        # for triggered incidents, decide tail vs body
+        tail_flags = np.random.rand(triggers_r.sum()) < p_tail_r
+        idxs = np.nonzero(triggers_r)[0]
+        # body samples
+        if (~tail_flags).any():
+            body_count = (~tail_flags).sum()
+            body_samples = np.random.lognormal(mean=cat_mu[IDX_REG], sigma=cat_sigma[IDX_REG], size=body_count)
+            total_by_cat[IDX_REG] += np.sum(body_samples * severities[idxs[~tail_flags]])
+        # tail samples (Pareto)
+        if tail_flags.any():
+            tail_count = tail_flags.sum()
+            tail_samples = draw_pareto(xm_r, alpha_r, size=tail_count)
+            total_by_cat[IDX_REG] += np.sum(tail_samples * severities[idxs[tail_flags]])
 
-plt.savefig('mitre_attack_analysis.png', dpi=300, bbox_inches='tight')
-print("\n" + "="*70)
-print("Visualization saved as 'mitre_attack_analysis.png'")
-print("="*70)
+    # Reputation: similar
+    triggers_rep = np.random.rand(n_succ) < p_trig_rep
+    if triggers_rep.any():
+        tail_flags_rep = np.random.rand(triggers_rep.sum()) < p_tail_rep
+        idxs_rep = np.nonzero(triggers_rep)[0]
+        if (~tail_flags_rep).any():
+            body_count = (~tail_flags_rep).sum()
+            body_samples = np.random.lognormal(mean=cat_mu[IDX_REP], sigma=cat_sigma[IDX_REP], size=body_count)
+            total_by_cat[IDX_REP] += np.sum(body_samples * severities[idxs_rep[~tail_flags_rep]])
+        if tail_flags_rep.any():
+            tail_count = tail_flags_rep.sum()
+            tail_samples = draw_pareto(xm_rep, alpha_rep, size=tail_count)
+            total_by_cat[IDX_REP] += np.sum(tail_samples * severities[idxs_rep[tail_flags_rep]])
 
+    cat_loss_matrix[i, :] = total_by_cat
+    annual_losses[i] = total_by_cat.sum()
+
+# -----------------------
+# Summaries
+# -----------------------
+mean_AAL = annual_losses.mean()
+median_AAL = np.median(annual_losses)
+p2_5, p97_5 = np.percentile(annual_losses, [2.5, 97.5])
+mean_incidents = incident_counts.mean()
+pct_zero = 100.0 * np.mean(annual_losses == 0.0)
+
+print("\nAAL posterior predictive summary (with zero-inflation, severity, Pareto tails):")
+print(f"Mean AAL: ${mean_AAL:,.0f}")
+print(f"Median AAL: ${median_AAL:,.0f}")
+print(f"95% CI: [${p2_5:,.0f}, ${p97_5:,.0f}]")
+print(f"Mean successful incidents / year: {mean_incidents:.2f}")
+print(f"% years with zero successful incidents: {pct_zero:.1f}%\n")
+
+# ------------------------------------------------------------
+# Category credible intervals (95% CI instead of means)
+# ------------------------------------------------------------
+print("Category-level annual loss 95% credible intervals:")
+for c, cat in enumerate(loss_categories):
+    low, mid, high = np.percentile(cat_loss_matrix[:, c], [2.5, 50, 97.5])
+    share_mid = 100.0 * mid / (median_AAL + 1e-12)
+    print(
+        f"  {cat:<24s} "
+        f"${low:,.0f} – ${high:,.0f}  (median ${mid:,.0f}, ≈{share_mid:.1f}% of median AAL)"
+    )
+
+# -----------------------
+# Plots (basic)
+# -----------------------
+plt.figure(figsize=(14,10))
+plt.subplot(2,2,1)
+plt.hist(lambda_draws, bins=40)
+plt.title('Posterior λ (attempts/year)')
+plt.grid(alpha=0.2)
+
+plt.subplot(2,2,2)
+plt.hist(p_overall_draws, bins=40)
+plt.title('Posterior overall success probability')
+plt.grid(alpha=0.2)
+
+plt.subplot(2,2,3)
+plt.hist(incident_counts, bins=range(0, max(incident_counts)+2))
+plt.title('Posterior predictive: successful incidents/year')
+plt.grid(alpha=0.2)
+
+plt.subplot(2,2,4)
+plt.hist(annual_losses, bins=120)
+plt.title('Posterior predictive: Annual Loss (USD)')
+plt.grid(alpha=0.2)
+plt.tight_layout()
 plt.show()
+
+# Log-tail plot
+nonzero = annual_losses[annual_losses > 0]
+if len(nonzero) > 0:
+    plt.figure(figsize=(6,4))
+    plt.hist(np.log10(nonzero), bins=60)
+    plt.title('Log10 Annual Loss (years with loss > 0)')
+    plt.xlabel('log10(USD)')
+    plt.grid(alpha=0.2)
+    plt.show()
+
+# Simple error-bar plot for category intervals
+lows = np.percentile(cat_loss_matrix, 2.5, axis=0)
+highs = np.percentile(cat_loss_matrix, 97.5, axis=0)
+meds = np.percentile(cat_loss_matrix, 50, axis=0)
+
+plt.figure(figsize=(7,4))
+plt.errorbar(loss_categories, meds, yerr=[meds-lows, highs-meds], fmt='o', capsize=5)
+plt.title('Category-level Annual Loss 95% Credible Intervals')
+plt.ylabel('USD')
+plt.grid(alpha=0.3)
+plt.show()
+
+# -----------------------
+# Save posterior predictive draws
+# -----------------------
+df = pd.DataFrame({
+    "lambda_draw": lambda_draws,
+    "p_overall_draw": p_overall_draws,
+    "incident_count": incident_counts,
+    "annual_loss": annual_losses
+})
+for idx, cat in enumerate(loss_categories):
+    df[f"loss_{cat}"] = cat_loss_matrix[:, idx]
+
+csv_name = "posterior_predictive_aal_fair_full_tail.csv"
+df.to_csv(csv_name, index=False)
+print(f"\nSaved posterior predictive draws (with FAIR decomposition) to '{csv_name}'")
