@@ -4,7 +4,7 @@ This code takes an initial (prior) estimate of the frequency of attacks against 
 
 It then simulates each attack as it progresses through the relevant MITRE ATT&CK tactics. Each tactic has an individually estimated range of control strength that gets applied.
 
-The result is then an posterior projection of the number of successful attacks that will actually get through the entire attack process.
+The result is then an posterior projection of the number of successful attacks that will actually get through the entire attack process. These are then combined with estimates of loss aligned to FAIR loss categories to compute Annual Loss.
 
 Requires:
 - Python
@@ -19,3 +19,5 @@ Sample Output:
 <img width="600" height="400" alt="Figure_2" src="https://github.com/user-attachments/assets/f5f979cd-e23e-49f2-81b4-2820d735e403" />
 
 <img width="700" height="400" alt="Figure_3" src="https://github.com/user-attachments/assets/74f12427-9ee5-47d9-8817-d8d52fc167d0" />
+
+Got lots of help on this from Anthropic Claude and ChatGPT.
