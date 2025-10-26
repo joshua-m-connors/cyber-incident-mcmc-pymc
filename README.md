@@ -13,12 +13,12 @@ Requires:
 - PyMC
 
 Acknowledgements:
-- Got lots of help on this from Anthropic Claude and ChatGPT.
+- I got a lot of help on this from Claude and ChatGPT.
 
 Sample Output:
 
-<img width="1088" height="976" alt="Screenshot From 2025-10-25 21-35-23" src="https://github.com/user-attachments/assets/f9c6eb92-71af-4ae2-b91a-9351ffb360ad" />
+<img width="1084" height="490" alt="Screenshot From 2025-10-26 13-35-00" src="https://github.com/user-attachments/assets/821de248-64b1-4956-aa6e-ee9abea5e3b3" />
 
-<img width="1400" height="1000" alt="Figure_1" src="https://github.com/user-attachments/assets/bcb2a86f-8ddc-40bd-850d-5e281363004e" />
+<img width="1500" height="1000" alt="Figure_1" src="https://github.com/user-attachments/assets/cc62637e-16df-4d4f-8a45-715281681cc1" />
 
-<img width="800" height="500" alt="Figure_2" src="https://github.com/user-attachments/assets/caeae889-29ac-4272-9f83-8feed463254a" />
+<img width="800" height="500" alt="Figure_2" src="https://github.com/user-attachments/assets/d70c75fe-79b2-49e6-9169-a303be566dc2" />
