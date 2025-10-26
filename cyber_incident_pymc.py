@@ -39,15 +39,20 @@ import os
 # 2) GLOBAL CONFIG — Purpose: model priors, runtime controls, plotting options
 # =============================================================================
 # Frequency prior (attempts/year), elicited as a 90% CI -> Lognormal params
-CI_MIN_FREQ, CI_MAX_FREQ, Z_90 = 2, 24, 1.645
+CI_MIN_FREQ = 0.01
+CI_MAX_FREQ = 50
+Z_90 = 1.645
 
 # PyMC sampling (tune for speed vs. accuracy)
-N_SAMPLES, N_TUNE, N_CHAINS = 1200, 800, 4
-TARGET_ACCEPT, RANDOM_SEED = 0.90, 42
+N_SAMPLES = 4000
+N_TUNE = 1000
+N_CHAINS = 4
+TARGET_ACCEPT = 0.90 
+RANDOM_SEED = 42
 
 # Parallel Monte Carlo (per posterior draw attacker simulations)
 N_WORKERS = None              # None -> use all logical cores
-N_SIM_PER_DRAW = 400          # Monte Carlo attempts per posterior draw
+N_SIM_PER_DRAW = 1000         # Monte Carlo attempts per posterior draw
 
 # Markov attacker behavior
 MAX_RETRIES_PER_STAGE = 3     # retries allowed at a stage
@@ -116,6 +121,13 @@ alphas, betas = np.array(alphas), np.array(betas)
 # 4) FAIR TAXONOMY — Purpose: define loss categories & distributions (heavy-tailed)
 # =============================================================================
 # Categories: two primary (lognormal bodies), two secondary (lognormal + Pareto tail triggers)
+"""
+Defines loss categories per the Factor Analysis of Information Risk (FAIR) model.
+
+- Primary losses (Productivity, ResponseContainment) are lognormal.
+- Secondary losses (RegulatoryLegal, ReputationCompetitive) have Pareto tails
+  to represent heavy-tailed risk events.
+"""
 loss_categories = ["Productivity", "ResponseContainment", "RegulatoryLegal", "ReputationCompetitive"]
 
 # Elicited 90% intervals per category (USD)
@@ -152,6 +164,10 @@ pareto_defaults = {
 # =============================================================================
 # 5) MARKOV ATTACKER MODEL — Purpose: simulate retries, fallback, detection
 # =============================================================================
+"""
+Simulates the MITRE ATT&CK process as a Markov chain, allowing retries and fallback.
+Each stage has a chance of success, detection, or failure.
+"""
 def simulate_one_attempt(success_probs_stage: np.ndarray,
                          rng: random.Random,
                          max_retries_per_stage: int = MAX_RETRIES_PER_STAGE,
@@ -239,6 +255,13 @@ def _annotate_percentiles(ax, data, percentiles=(50, 90, 95, 99), scale=1.0, mon
 # 8) MAIN — Purpose: orchestrate inference, parallel MC, loss sim, summaries, plots
 # =============================================================================
 def main():
+    """
+    Main driver function:
+     - Samples from Bayesian posterior for λ (frequency) and per-stage success.
+     - Runs parallel Monte Carlo Markov simulations of attack progression.
+     - Computes posterior predictive distributions of annualized losses.
+     - Produces FAIR-aligned summaries and optional visualizations.
+    """
     # ---------- 8.1 Build & sample Bayesian model (λ and per-stage success) ----------
     with pm.Model() as model:
         # Frequency prior: lognormal via elicited 90% CI
@@ -328,48 +351,68 @@ def main():
 
     # ---------- 8.5 Visualization: original 2×2 grid + separate log-scale tail ----------
     sns.set_style("whitegrid")
+    # ---- Improved Visualization with automatic long-tail handling ----
+    def auto_clip(data, low=0.001, high=0.995):
+        """Clips data to percentile range for better visualization of long tails."""
+        if len(data) == 0:
+            return data
+        low_v, high_v = np.percentile(data, [low * 100, high * 100])
+        return data[(data >= low_v) & (data <= high_v)]
+
+    def annotate_percentiles(ax, data, percentiles=(50, 90, 95, 99), scale=1.0, money=True):
+        """Annotates percentile lines on histogram."""
+        ymax = ax.get_ylim()[1] if ax.get_ylim()[1] > 0 else 1.0
+        for p in percentiles:
+            val = np.percentile(data, p) / scale
+            ax.axvline(val, color='k', linestyle='--', lw=0.8, alpha=0.85)
+            label = f"P{p}=" + (f"${val:,.0f}" if money else f"{val:,.3f}")
+            ax.text(val, ymax * 0.92, label, rotation=90, va='top', ha='center',
+                    fontsize=8, backgroundcolor='white')
+
     scale = 1e6 if PLOT_IN_MILLIONS else 1.0
     scale_label = "Million USD" if PLOT_IN_MILLIONS else "USD"
 
-    # 2×2 Dashboard visualization
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
 
     # (1) Posterior λ (attacks/year)
-    axes[0, 0].hist(lambda_draws, bins=40, color="steelblue", alpha=0.85)
+    data_lambda = auto_clip(lambda_draws)
+    axes[0, 0].hist(data_lambda, bins=40, color='steelblue', alpha=0.85)
     axes[0, 0].set_title("Posterior λ (attacks/year)")
-    axes[0, 0].set_xlabel("λ")
+    axes[0, 0].set_xlabel("λ (attacks/year)")
     axes[0, 0].set_ylabel("Frequency")
+    annotate_percentiles(axes[0, 0], data_lambda, money=False)
 
-    # (2) Per-attempt success probability (simulated)
-    axes[0, 1].hist(p_success_simulated, bins=40, color="steelblue", alpha=0.85)
+    # (2) Per-attempt success probability
+    data_success = auto_clip(p_success_simulated)
+    axes[0, 1].hist(data_success, bins=40, color='steelblue', alpha=0.85)
     axes[0, 1].set_title("Per-attempt success probability (simulated)")
     axes[0, 1].set_xlabel("Probability")
     axes[0, 1].set_ylabel("Frequency")
-    _annotate_percentiles(axes[0, 1], p_success_simulated, money=False)
+    annotate_percentiles(axes[0, 1], data_success, money=False)
 
-    # (3) Successful incidents per year
-    max_bins = max(int(incident_counts.max()) + 1, 10)
-    axes[1, 0].hist(incident_counts, bins=range(0, max_bins), color="steelblue", alpha=0.85)
+    # (3) Successful incidents/year
+    data_incidents = auto_clip(incident_counts)
+    axes[1, 0].hist(data_incidents, bins=40, color='steelblue', alpha=0.85)
     axes[1, 0].set_title("Successful incidents / year (posterior predictive)")
     axes[1, 0].set_xlabel("Count")
     axes[1, 0].set_ylabel("Frequency")
-    _annotate_percentiles(axes[1, 0], incident_counts, money=False)
+    annotate_percentiles(axes[1, 0], data_incidents, money=False)
 
-    # (4) Annual Loss — truncated linear view (0.5–99th percentile)
+    # (4) Annual loss (USD)
     nonzero = annual_losses[annual_losses > 0]
     if len(nonzero) > 0:
-        low_lin, high_lin = np.percentile(nonzero, [0.5, 99.0])
-        mask = (annual_losses > low_lin) & (annual_losses < high_lin)
-        axes[1, 1].hist(annual_losses[mask] / scale, bins=80, color="steelblue", alpha=0.85)
-        axes[1, 1].set_title("Annual Loss (posterior predictive)\nTruncated 0.5–99th percentile")
+        data_loss = auto_clip(nonzero)
+        axes[1, 1].hist(data_loss / scale, bins=80, color='steelblue', alpha=0.85)
+        axes[1, 1].set_title("Annual Loss (posterior predictive)")
         axes[1, 1].set_xlabel(f"Annual Loss ({scale_label})")
         axes[1, 1].set_ylabel("Frequency")
-        _annotate_percentiles(axes[1, 1], annual_losses[mask], scale=scale, money=True)
+        annotate_percentiles(axes[1, 1], data_loss, scale=scale, money=True)
     else:
         axes[1, 1].text(0.5, 0.5, "All draws are zero", ha="center", va="center")
 
     plt.tight_layout()
     plt.show()
+
 
     # Separate log-scale plot for heavy-tail view
     if len(nonzero) > 0:
@@ -456,8 +499,6 @@ def main():
         "annual_losses": annual_losses,
         "cat_loss_matrix": cat_loss_matrix,
     }
-
-
 
 # =============================================================================
 # 9) ENTRY POINT — Purpose: safe multiprocessing on all OSes
