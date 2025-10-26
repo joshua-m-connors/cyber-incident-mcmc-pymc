@@ -12,12 +12,12 @@ Requires:
 
 Sample Output:
 
-<img width="1296" height="706" alt="Screenshot From 2025-10-25 15-49-40" src="https://github.com/user-attachments/assets/f3d1e7ae-06d7-489e-bd02-cf57800c9590" />
+<img width="1088" height="976" alt="Screenshot From 2025-10-25 21-35-23" src="https://github.com/user-attachments/assets/f9c6eb92-71af-4ae2-b91a-9351ffb360ad" />
 
-<img width="1400" height="1000" alt="Figure_1" src="https://github.com/user-attachments/assets/95eefe2c-0422-4b2e-b05c-61edb76e66d6" />
+<img width="1400" height="1000" alt="Figure_1" src="https://github.com/user-attachments/assets/53b82d52-3bba-45e6-a94a-1dfebef89c36" />
 
-<img width="600" height="400" alt="Figure_2" src="https://github.com/user-attachments/assets/f5f979cd-e23e-49f2-81b4-2820d735e403" />
+<img width="800" height="500" alt="Figure_2" src="https://github.com/user-attachments/assets/62f49c11-e6d0-45f0-9bf9-661e77af6a38" />
 
-<img width="700" height="400" alt="Figure_3" src="https://github.com/user-attachments/assets/74f12427-9ee5-47d9-8817-d8d52fc167d0" />
 
-Got lots of help on this from Anthropic Claude and ChatGPT.
+Acknowledgements:
+- Got lots of help on this from Anthropic Claude and ChatGPT.
