@@ -39,8 +39,8 @@ import os
 # 2) GLOBAL CONFIG — Purpose: model priors, runtime controls, plotting options
 # =============================================================================
 # Frequency prior (attempts/year), elicited as a 90% CI -> Lognormal params
-CI_MIN_FREQ = 0.01
-CI_MAX_FREQ = 50
+CI_MIN_FREQ = 1
+CI_MAX_FREQ = 30
 Z_90 = 1.645
 
 # PyMC sampling (tune for speed vs. accuracy)
@@ -134,8 +134,8 @@ loss_categories = ["Productivity", "ResponseContainment", "RegulatoryLegal", "Re
 loss_q5_q95 = {
     "Productivity": (10_000, 150_000),
     "ResponseContainment": (20_000, 500_000),
-    "RegulatoryLegal": (0, 1_000_000),
-    "ReputationCompetitive": (0, 2_000_000),
+    "RegulatoryLegal": (0, 2_000_000),
+    "ReputationCompetitive": (0, 5_000_000),
 }
 
 def _lognormal_from_q5_q95(q5: float, q95: float):
@@ -258,10 +258,18 @@ def main():
     """
     Main driver function:
      - Samples from Bayesian posterior for λ (frequency) and per-stage success.
+     - Optionally conditions on observed incident data (Option B).
      - Runs parallel Monte Carlo Markov simulations of attack progression.
      - Computes posterior predictive distributions of annualized losses.
      - Produces FAIR-aligned summaries and optional visualizations.
     """
+
+    # ---------- 8.0 Optional Observed Data Inputs (Option B) ----------
+    # You can set these to real numbers if you have data.
+    # If both are None, the model runs prior-driven (no likelihood term).
+    observed_total_incidents = None    # e.g., 7 if 7 successful incidents observed
+    observed_years = None              # e.g., 3 if those occurred over 3 years
+
     # ---------- 8.1 Build & sample Bayesian model (λ and per-stage success) ----------
     with pm.Model() as model:
         # Frequency prior: lognormal via elicited 90% CI
@@ -272,9 +280,22 @@ def main():
         # Per-stage attacker success probabilities (Beta priors from SME intervals)
         success_probs = pm.Beta("success_probs", alpha=alphas, beta=betas, shape=len(MITRE_STAGES))
 
+        # --- Optional observed-data likelihood (Option B) ---
+        if observed_total_incidents is not None and observed_years is not None:
+            pm.Poisson(
+                "obs_incidents",
+                mu=lambda_rate * observed_years,
+                observed=observed_total_incidents,
+            )
+            print(f"Conditioning on observed data: {observed_total_incidents} incidents over {observed_years} years.")
+        else:
+            print("No observed incident data provided — running fully prior-driven.")
+
         # Sample posterior
-        trace = pm.sample(draws=N_SAMPLES, tune=N_TUNE, chains=N_CHAINS,
-                          target_accept=TARGET_ACCEPT, random_seed=RANDOM_SEED, progressbar=True)
+        trace = pm.sample(
+            draws=N_SAMPLES, tune=N_TUNE, chains=N_CHAINS,
+            target_accept=TARGET_ACCEPT, random_seed=RANDOM_SEED, progressbar=True
+        )
 
     posterior = trace.posterior
     lambda_draws = posterior["lambda_rate"].values.reshape(-1)
@@ -314,20 +335,18 @@ def main():
         resp = np.sum(rng_np.lognormal(cat_mu[1], cat_sigma[1], size=n_succ) * severities)
 
         # Secondary categories: zero-inflated + Pareto heavy tails
-        # (Here we trigger at most once per year for simplicity; extend to per-incident if needed.)
         reg = 0.0
-        if rng_np.random() < 0.20:  # trigger probability for Regulatory/Legal
+        if rng_np.random() < 0.20:
             xm, alpha = pareto_defaults["RegulatoryLegal"]["xm"], pareto_defaults["RegulatoryLegal"]["alpha"]
-            reg = xm * (1.0 + rng_np.pareto(alpha))  # Pareto Type I shifted by xm
+            reg = xm * (1.0 + rng_np.pareto(alpha))
 
         rep = 0.0
-        if rng_np.random() < 0.20:  # trigger probability for Reputation/Competitive
+        if rng_np.random() < 0.20:
             xm, alpha = pareto_defaults["ReputationCompetitive"]["xm"], pareto_defaults["ReputationCompetitive"]["alpha"]
             rep = xm * (1.0 + rng_np.pareto(alpha))
 
         cat_loss_matrix[i, :] = [prod, resp, reg, rep]
         annual_losses[i] = prod + resp + reg + rep
-
 
     # ---------- 8.4 Summaries: AAL and category credible intervals ----------
     mean_AAL = annual_losses.mean()
