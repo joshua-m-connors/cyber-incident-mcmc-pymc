@@ -1,6 +1,6 @@
 Cyber Incident Estimation utilizing Markov Chain Monte Carlo (MCMC) simulation
 
-This code takes an initial (prior) estimate of the frequency of attacks against an orgnaization. This range would be similar to Threat Event Frequency (TEF) in the Factor Analysis of Information Risk (FAIR) taxonomy.
+This code takes an initial (prior) estimate of the frequency of attacks against an organization. This range would be similar to Threat Event Frequency (TEF) in the Factor Analysis of Information Risk (FAIR) taxonomy.
 
 Note: There is an option (lines 37 & 38) to enter actual observational data (i.e. if you know there were 2 successful incidents in the past year you can enter that in line 38).
 
