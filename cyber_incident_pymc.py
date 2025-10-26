@@ -1,69 +1,72 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-cyber_incident_pymc_parallel_full_fixed.py
+cyber_risk_simulation_main_explained_final.py
 
-Full pipeline (wrapped in main()):
- - User-friendly MITRE stage definition
- - PyMC sampling for lambda and per-stage success
- - Parallel Monte Carlo per-posterior-draw Markov attacker simulator (retries/fallback/detection)
- - Posterior-predictive compound-Poisson AAL simulation with FAIR decomposition
- - Improved plotting: truncated linear view + log-scale tail + percentile annotations
- - Saves CSV of posterior predictive draws.
+PURPOSE
+-------
+A comprehensive, end-to-end Bayesian cyber risk simulation that:
+  1) infers attacker frequency and per-stage success from priors (PyMC),
+  2) simulates attacker progression through MITRE ATT&CK as a Markov process
+     (retries with diminishing returns, fallback, increasing detection),
+  3) quantifies financial impact using a FAIR-aligned taxonomy with heavy tails,
+  4) executes per-draw Monte Carlo in parallel (safe, top-level worker),
+  5) summarizes Annualized Loss (AAL) and category-level credible intervals,
+  6) visualizes key posteriors in a 2×2 grid and a separate log-scale tail plot.
 
-Requirements:
-pip install pymc arviz matplotlib pandas scipy numpy
+This file is structured for safe multiprocessing on all OSes (Windows/macOS/Linux)
+and can be run as a script. It can also be imported and `main()` invoked explicitly.
 """
-from __future__ import annotations
-import time
-import math
+
+# =============================================================================
+# 1) IMPORTS — Purpose: all libraries used for inference, simulation, and plots
+# =============================================================================
+
 import random
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
 import numpy as np
-import pandas as pd
 import pymc as pm
-import arviz as az
-import matplotlib.pyplot as plt
 from scipy import stats, optimize
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import List, Tuple, Optional
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import datetime
+import os
 
-# -----------------------
-# USER INPUTS (customize)
-# -----------------------
-CI_MIN_FREQ = 0.01
-CI_MAX_FREQ = 10
-Z_90 = 1.645
 
-# Observed/synthetic data (choose one or none)
-observed_success_counts = None  # e.g. {'attempts': 100, 'successes': 5}
-observed_successes_per_year = None  # e.g. 5
+# =============================================================================
+# 2) GLOBAL CONFIG — Purpose: model priors, runtime controls, plotting options
+# =============================================================================
+# Frequency prior (attempts/year), elicited as a 90% CI -> Lognormal params
+CI_MIN_FREQ, CI_MAX_FREQ, Z_90 = 2, 24, 1.645
 
-# Parallel Monte Carlo settings
-N_WORKERS = None  # None => uses cpu_count()
-N_SIM_PER_DRAW = 400    # MC attempts per posterior draw to estimate per-attempt success
-SUBSAMPLE_POSTERIOR = None  # None => use all posterior draws; set int to subsample for speed
+# PyMC sampling (tune for speed vs. accuracy)
+N_SAMPLES, N_TUNE, N_CHAINS = 1200, 800, 4
+TARGET_ACCEPT, RANDOM_SEED = 0.90, 42
 
-# Markov-simulator behaviour
-MAX_RETRIES_PER_STAGE = 3  # 0–5: 0 = no retry, 3 is a common default for moderate persistence.
-RETRY_PENALTY = 0.75       # between 0.6–0.9: smaller means retries quickly lose effectiveness.
-FALLBACK_PROB = 0.25       # 0.1–0.5: higher means attackers often step back and try alternate techniques.
-DETECT_BASE = 0.01         # small (0.005–0.02) and reflects base detection chance per failed attempt.
-DETECT_INC_PER_RETRY = 0.06     # 0.02–0.1 are typical if you want detection to ramp up with repeated failed attempts.
+# Parallel Monte Carlo (per posterior draw attacker simulations)
+N_WORKERS = None              # None -> use all logical cores
+N_SIM_PER_DRAW = 400          # Monte Carlo attempts per posterior draw
 
-# PyMC sampling config
-N_SAMPLES = 1200
-N_TUNE = 800
-N_CHAINS = 4
-TARGET_ACCEPT = 0.9
-RANDOM_SEED = 42
+# Markov attacker behavior
+MAX_RETRIES_PER_STAGE = 3     # retries allowed at a stage
+RETRY_PENALTY = 0.75          # each retry multiplies base success probability (diminishing returns)
+FALLBACK_PROB = 0.25          # probability to step back one stage after exhausting retries
+DETECT_BASE = 0.01            # base detection probability on a failed try
+DETECT_INC_PER_RETRY = 0.06   # incremental detection added per retry
 
-# Plot settings
-PLOT_IN_MILLIONS = True  # display losses in millions on the histograms
+# Visualization
+PLOT_IN_MILLIONS = True       # show currency axes in millions USD
 
-# -----------------------
-# User-friendly MITRE stage map: edit here
-# -----------------------
+
+# =============================================================================
+# 3) MITRE ATT&CK PRIORS — Purpose: convert control effectiveness to Beta priors
+# =============================================================================
+# SME-provided 90% CI for control effectiveness per MITRE stage.
+# We convert to attacker success: success ∈ [1 - hi, 1 - lo], then fit Beta via quantile-matching.
 STAGE_CONTROL_MAP = {
-    "Initial Access":        (0.25, 0.65),
+    "Initial Access":        (0.15, 0.50),
     "Execution":             (0.05, 0.30),
     "Persistence":           (0.10, 0.45),
     "Privilege Escalation":  (0.10, 0.35),
@@ -76,350 +79,234 @@ STAGE_CONTROL_MAP = {
     "Exfiltration":          (0.30, 0.70),
     "Impact":                (0.35, 0.75),
 }
-
-# Validate and extract
 MITRE_STAGES = list(STAGE_CONTROL_MAP.keys())
-stage_control_effectiveness: List[Tuple[float, float]] = []
-for s, eff in STAGE_CONTROL_MAP.items():
-    if not (isinstance(eff, (list, tuple)) and len(eff) == 2):
-        raise ValueError(f"Stage '{s}' must have a (min,max) tuple for control effectiveness.")
-    low, high = eff
-    if not (0 <= low < high <= 1):
-        raise ValueError(f"Stage '{s}' has invalid effectiveness bounds ({low}, {high}). Must be within [0,1].")
-    stage_control_effectiveness.append((low, high))
-NUM_STAGES = len(MITRE_STAGES)
 
-# -----------------------
-# Convert control-effectiveness -> attacker success 90% CI (5% & 95%)
-# -----------------------
-stage_success_ranges = [(1.0 - max_eff, 1.0 - min_eff) for (min_eff, max_eff) in stage_control_effectiveness]
 
-def quantile_match_beta(p5: float, p95: float, q_low: float = 0.05, q_high: float = 0.95):
+def _quantile_match_beta(p5: float, p95: float, q_low: float = 0.05, q_high: float = 0.95):
+    """
+    Purpose: derive Beta(α,β) whose 5th and 95th percentiles match (p5, p95).
+    This lets you encode SME 90% intervals directly as Beta priors.
+    """
     mean = 0.5 * (p5 + p95)
-    range_width = max(p95 - p5, 1e-6)
-    concentration_guess = 20.0 * (0.1 / range_width)
+    width = max(p95 - p5, 1e-6)
+    concentration_guess = 20.0 * (0.1 / width)   # loose heuristic to start
     a0 = max(1e-3, mean * concentration_guess)
     b0 = max(1e-3, (1.0 - mean) * concentration_guess)
-    def residuals(params):
+
+    def resid(params):
         a, b = params
         if a <= 0 or b <= 0:
             return [1e6, 1e6]
-        return [
-            stats.beta.ppf(q_low, a, b) - p5,
-            stats.beta.ppf(q_high, a, b) - p95
-        ]
-    sol = optimize.root(residuals, [a0, b0], method='hybr')
-    if sol.success and np.all(sol.x > 0):
+        return [stats.beta.ppf(q_low, a, b) - p5,
+                stats.beta.ppf(q_high, a, b) - p95]
+
+    sol = optimize.root(resid, [a0, b0], method="hybr")
+    if sol.success and np.all(np.array(sol.x) > 0):
         return float(sol.x[0]), float(sol.x[1])
-    return float(a0), float(b0)
+    return a0, b0
 
-alphas, betas = zip(*(quantile_match_beta(lo, hi) for lo, hi in stage_success_ranges))
-alphas = np.array(alphas)
-betas = np.array(betas)
 
-# -----------------------
-# FAIR categories & per-category Q5/Q95 (edit as needed)
-# -----------------------
-loss_categories = [
-    "Productivity",
-    "ResponseContainment",
-    "RegulatoryLegal",
-    "ReputationCompetitive"
-]
-NCAT = len(loss_categories)
+# Convert control effectiveness to attacker success 90% CI per stage
+_success_90s = [(1.0 - hi, 1.0 - lo) for (lo, hi) in STAGE_CONTROL_MAP.values()]
+alphas, betas = zip(*(_quantile_match_beta(lo, hi) for (lo, hi) in _success_90s))
+alphas, betas = np.array(alphas), np.array(betas)
+
+
+# =============================================================================
+# 4) FAIR TAXONOMY — Purpose: define loss categories & distributions (heavy-tailed)
+# =============================================================================
+# Categories: two primary (lognormal bodies), two secondary (lognormal + Pareto tail triggers)
+loss_categories = ["Productivity", "ResponseContainment", "RegulatoryLegal", "ReputationCompetitive"]
+
+# Elicited 90% intervals per category (USD)
 loss_q5_q95 = {
     "Productivity": (10_000, 150_000),
     "ResponseContainment": (20_000, 500_000),
-    "RegulatoryLegal": (0, 2_000_000),
-    "ReputationCompetitive": (0, 5_000_000)
+    "RegulatoryLegal": (0, 1_000_000),
+    "ReputationCompetitive": (0, 2_000_000),
 }
 
-def lognormal_from_q5_q95(q5: float, q95: float):
-    q5 = max(q5, 1.0)
-    q95 = max(q95, q5 * 1.0001)
-    ln_q5, ln_q95 = np.log(q5), np.log(q95)
-    sigma = (ln_q95 - ln_q5) / (2.0 * Z_90)
-    mu = 0.5 * (ln_q5 + ln_q95)
+def _lognormal_from_q5_q95(q5: float, q95: float):
+    """
+    Purpose: invert 5th/95th percentiles to (mu, sigma) in log-space for Lognormal.
+    """
+    q5, q95 = max(q5, 1.0), max(q95, q5 * 1.0001)
+    ln5, ln95 = np.log(q5), np.log(q95)
+    sigma = (ln95 - ln5) / (2.0 * Z_90)
+    mu = 0.5 * (ln5 + ln95)
     return mu, sigma
 
-cat_mu = np.zeros(NCAT)
-cat_sigma = np.zeros(NCAT)
+cat_mu = np.zeros(len(loss_categories))
+cat_sigma = np.zeros(len(loss_categories))
 for i, cat in enumerate(loss_categories):
-    q5, q95 = loss_q5_q95.get(cat, (1.0, 1.0))
-    mu, sigma = lognormal_from_q5_q95(q5, q95)
-    cat_mu[i] = mu
-    cat_sigma[i] = sigma
+    mu, sg = _lognormal_from_q5_q95(*loss_q5_q95[cat])
+    cat_mu[i], cat_sigma[i] = mu, sg
 
-# Pareto defaults for secondaries
+# Pareto tail (Type I) params for secondary losses (heavy tails)
 pareto_defaults = {
-    "RegulatoryLegal": {"xm": 100_000.0, "alpha": 1.8},
-    "ReputationCompetitive": {"xm": 250_000.0, "alpha": 1.5}
+    "RegulatoryLegal":       {"xm": 100_000.0, "alpha": 1.8},
+    "ReputationCompetitive": {"xm": 250_000.0, "alpha": 1.5},
 }
-IDX_REG = loss_categories.index("RegulatoryLegal")
-IDX_REP = loss_categories.index("ReputationCompetitive")
 
-# -----------------------
-# Pareto sampler helper
-# -----------------------
-def draw_pareto(xm: float, alpha: float, size: int = 1, rng: Optional[np.random.Generator] = None):
-    if rng is None:
-        rng = np.random
-    return xm * (1.0 + rng.pareto(alpha, size=size))
 
-# -----------------------
-# Markov-chain single-attempt simulator (top-level so picklable)
-# -----------------------
+# =============================================================================
+# 5) MARKOV ATTACKER MODEL — Purpose: simulate retries, fallback, detection
+# =============================================================================
 def simulate_one_attempt(success_probs_stage: np.ndarray,
                          rng: random.Random,
-                         max_retries_per_stage: int = 2,
-                         retry_penalty: float = 0.8,
-                         fallback_prob: float = 0.3,
-                         detect_base: float = 0.01,
-                         detect_increase_per_retry: float = 0.05) -> bool:
+                         max_retries_per_stage: int = MAX_RETRIES_PER_STAGE,
+                         retry_penalty: float = RETRY_PENALTY,
+                         fallback_prob: float = FALLBACK_PROB,
+                         detect_base: float = DETECT_BASE,
+                         detect_increase_per_retry: float = DETECT_INC_PER_RETRY) -> bool:
     """
-    Simulate a single attacker attempt through ordered stages using python.random.Random rng.
-    Return True if attacker completes all stages (success), False if detected or gives up.
-    """
-    num_stages = len(success_probs_stage)
-    stage_idx = 0
+    Simulate a single attacker attempt through ordered MITRE stages.
 
-    if np.isscalar(max_retries_per_stage):
-        max_retries = [int(max_retries_per_stage)] * num_stages
-    else:
-        max_retries = [int(x) for x in max_retries_per_stage]
+    Mechanics:
+      - At each stage, the attacker gets (retries+1) attempts.
+      - Success prob per retry decays: p_try = (retry_penalty**k) * base_p.
+      - After each failed try, run a detection check with probability increasing in k.
+      - If all retries at a stage fail, attacker may fallback to previous stage.
+
+    Returns:
+        True if all stages are completed (full compromise), else False.
+    """
+    stage_idx = 0
+    nstages = len(success_probs_stage)
 
     while True:
-        if stage_idx >= num_stages:
-            return True
+        if stage_idx >= nstages:
+            return True  # completed all stages
 
         p_base = float(success_probs_stage[stage_idx])
-        retries_allowed = max_retries[stage_idx]
-        retry_count = 0
-        succeeded_this_stage = False
 
-        while retry_count <= retries_allowed:
-            p_try = (retry_penalty ** retry_count) * p_base
-            u = rng.random()
-            if u < p_try:
-                succeeded_this_stage = True
-                break
-            # failed attempt => detection check
-            detect_prob = detect_base + detect_increase_per_retry * retry_count
-            detect_prob = min(max(detect_prob, 0.0), 1.0)
+        # Attempt initial + retries
+        for k in range(max_retries_per_stage + 1):
+            p_try = (retry_penalty ** k) * p_base
+            if rng.random() < p_try:
+                break  # proceed to next stage
+            # detection escalates with retries at the current stage
+            detect_prob = min(max(detect_base + detect_increase_per_retry * k, 0.0), 1.0)
             if rng.random() < detect_prob:
-                return False
-            retry_count += 1
-
-        if succeeded_this_stage:
-            stage_idx += 1
-            continue
+                return False  # detected & stopped
         else:
-            if stage_idx == 0:
+            # exhausted retries without success
+            if stage_idx == 0 or rng.random() > fallback_prob:
                 return False
-            if rng.random() < fallback_prob:
-                stage_idx = max(0, stage_idx - 1)
-                continue
-            else:
-                return False
+            stage_idx -= 1  # fallback one stage
+            continue
 
-# -----------------------
-# Monte Carlo estimator for per-draw per-attempt success probability
-# (picklable)
-# -----------------------
-def estimate_per_attempt_success(success_probs_stage: np.ndarray,
-                                 n_sim: int = 500,
-                                 max_retries_per_stage: int = 2,
-                                 retry_penalty: float = 0.8,
-                                 fallback_prob: float = 0.3,
-                                 detect_base: float = 0.01,
-                                 detect_increase_per_retry: float = 0.05,
-                                 seed: Optional[int] = None) -> float:
-    if seed is None:
-        seed = int(time.time() * 1000) % (2**31 - 1)
-    rng = random.Random(seed)
-    success_count = 0
+        # success at this stage: move forward
+        stage_idx += 1
+
+
+# =============================================================================
+# 6) PARALLEL WORKER — Purpose: per-draw Monte Carlo to estimate success prob
+# =============================================================================
+def worker_function(args) -> float:
+    """
+    Top-level (picklable) worker for ProcessPoolExecutor.
+
+    Args:
+        args: tuple(per_stage_probs, n_sim, seed)
+
+    Returns:
+        Estimated per-attempt success probability for this posterior draw.
+    """
+    per_stage, n_sim, seed = args
+    rng = random.Random(int(seed))
+    successes = 0
     for _ in range(int(n_sim)):
-        ok = simulate_one_attempt(success_probs_stage,
-                                  rng=rng,
-                                  max_retries_per_stage=max_retries_per_stage,
-                                  retry_penalty=retry_penalty,
-                                  fallback_prob=fallback_prob,
-                                  detect_base=detect_base,
-                                  detect_increase_per_retry=detect_increase_per_retry)
-        if ok:
-            success_count += 1
-    return success_count / float(n_sim)
+        if simulate_one_attempt(np.asarray(per_stage), rng):
+            successes += 1
+    return successes / float(n_sim)
 
-# Worker wrapper to submit to ProcessPoolExecutor
-def worker_arg_tuple(per_stage: np.ndarray, seed: int, n_sim: int) -> Tuple:
-    return (per_stage, n_sim, MAX_RETRIES_PER_STAGE, RETRY_PENALTY, FALLBACK_PROB, DETECT_BASE, DETECT_INC_PER_RETRY, seed)
 
-def worker_function(args: Tuple) -> float:
-    # args: (per_stage, n_sim, max_retries, retry_penalty, fallback_prob, detect_base, detect_inc, seed)
-    per_stage, n_sim, max_retries, retry_penalty, fallback_prob, detect_base, detect_inc, seed = args
-    return estimate_per_attempt_success(per_stage,
-                                        n_sim=n_sim,
-                                        max_retries_per_stage=max_retries,
-                                        retry_penalty=retry_penalty,
-                                        fallback_prob=fallback_prob,
-                                        detect_base=detect_base,
-                                        detect_increase_per_retry=detect_inc,
-                                        seed=int(seed))
+# =============================================================================
+# 7) UTIL: Percentile annotation — Purpose: add P50/P90/P95/P99 lines on plots
+# =============================================================================
+def _annotate_percentiles(ax, data, percentiles=(50, 90, 95, 99), scale=1.0, money=True):
+    ymax = ax.get_ylim()[1]
+    for p in percentiles:
+        val = np.percentile(data, p) / scale
+        ax.axvline(val, color='k', linestyle='--', lw=0.8, alpha=0.8)
+        label = f"P{p}=" + (f"${val:,.0f}" if money else f"{val:,.3f}")
+        ax.text(val, ymax * 0.92, label, rotation=90, va='top', ha='center',
+                fontsize=8, backgroundcolor='white')
 
-# -----------------------
-# Main execution
-# -----------------------
+
+# =============================================================================
+# 8) MAIN — Purpose: orchestrate inference, parallel MC, loss sim, summaries, plots
+# =============================================================================
 def main():
-    print(f"Loaded {NUM_STAGES} MITRE stages:")
-    for i, (name, (lo, hi)) in enumerate(zip(MITRE_STAGES, stage_control_effectiveness), 1):
-        print(f"  {i:2d}. {name:<22s}  control effectiveness: {lo:.2f}–{hi:.2f}")
-
-    print("\nBuilding PyMC model and sampling posterior (may take a few minutes)...")
+    # ---------- 8.1 Build & sample Bayesian model (λ and per-stage success) ----------
     with pm.Model() as model:
+        # Frequency prior: lognormal via elicited 90% CI
         mu_lambda = np.log(np.sqrt(CI_MIN_FREQ * CI_MAX_FREQ))
         sigma_lambda = (np.log(CI_MAX_FREQ) - np.log(CI_MIN_FREQ)) / (2.0 * Z_90)
-        lambda_rate = pm.Lognormal('lambda_rate', mu=mu_lambda, sigma=sigma_lambda)
+        lambda_rate = pm.Lognormal("lambda_rate", mu=mu_lambda, sigma=sigma_lambda)
 
-        success_probs = pm.Beta('success_probs', alpha=alphas, beta=betas, shape=NUM_STAGES)
+        # Per-stage attacker success probabilities (Beta priors from SME intervals)
+        success_probs = pm.Beta("success_probs", alpha=alphas, beta=betas, shape=len(MITRE_STAGES))
 
-        if observed_success_counts is not None:
-            attempts = int(observed_success_counts['attempts'])
-            successes = int(observed_success_counts['successes'])
-            pm.Binomial('obs_stage_aggregate', n=attempts, p=pm.math.prod(success_probs), observed=successes)
-
-        if observed_successes_per_year is not None:
-            overall_det = pm.Deterministic('overall_success_prob_det', pm.math.prod(success_probs))
-            expected_det = pm.Deterministic('expected_successes_det', lambda_rate * overall_det)
-            pm.Poisson('obs_successes_year', mu=expected_det, observed=int(observed_successes_per_year))
-
+        # Sample posterior
         trace = pm.sample(draws=N_SAMPLES, tune=N_TUNE, chains=N_CHAINS,
-                          target_accept=TARGET_ACCEPT, random_seed=RANDOM_SEED,
-                          return_inferencedata=True)
-
-    print("Sampling finished.")
+                          target_accept=TARGET_ACCEPT, random_seed=RANDOM_SEED, progressbar=True)
 
     posterior = trace.posterior
-    nchains = posterior.sizes['chain']
-    ndraws = posterior.sizes['draw']
-    R_total = nchains * ndraws
-    print(f"Posterior draws: chains={nchains}, draws={ndraws}, total={R_total}")
-
-    lambda_draws = posterior['lambda_rate'].values.reshape(-1)
-    success_probs_draws = posterior['success_probs'].values.reshape(-1, NUM_STAGES)
-
-    # optional subsample
-    if SUBSAMPLE_POSTERIOR is not None and 0 < SUBSAMPLE_POSTERIOR < len(lambda_draws):
-        rng_idx = np.random.default_rng(RANDOM_SEED)
-        idxs = rng_idx.choice(len(lambda_draws), size=SUBSAMPLE_POSTERIOR, replace=False)
-        lambda_draws = lambda_draws[idxs]
-        success_probs_draws = success_probs_draws[idxs, :]
-        print(f"Subsampled posterior draws to {len(lambda_draws)} for faster MC.")
-
+    lambda_draws = posterior["lambda_rate"].values.reshape(-1)
+    success_probs_draws = posterior["success_probs"].values.reshape(-1, len(MITRE_STAGES))
     R = len(lambda_draws)
-    print(f"Running parallel Monte Carlo: {R} posterior draws × {N_SIM_PER_DRAW} sims/draw ...")
+    print(f"Posterior samples: {R}")
 
-    # Build worker args list
-    worker_args = []
-    for i in range(R):
-        seed = 100000 + i
-        per_stage = success_probs_draws[i, :].astype(float)
-        # Per worker tuple ordering matches worker_function unpacking
-        worker_args.append((per_stage, N_SIM_PER_DRAW, MAX_RETRIES_PER_STAGE, RETRY_PENALTY, FALLBACK_PROB, DETECT_BASE, DETECT_INC_PER_RETRY, seed))
-
-    # Run parallel jobs
+    # ---------- 8.2 Parallel per-draw Markov simulation of per-attempt success ----------
+    args_list = [(success_probs_draws[i, :], N_SIM_PER_DRAW, 1000 + i) for i in range(R)]
     p_success_simulated = np.zeros(R, dtype=float)
-    import multiprocessing
-    n_workers = N_WORKERS or multiprocessing.cpu_count()
-    print(f"Using up to {n_workers} worker processes.")
-    t0 = time.time()
-    with ProcessPoolExecutor(max_workers=n_workers) as exe:
-        futures = {exe.submit(worker_function, arg): idx for idx, arg in enumerate(worker_args)}
-        completed = 0
-        for fut in as_completed(futures):
-            idx = futures[fut]
-            try:
-                result = fut.result()
-            except Exception as e:
-                print(f"Worker for draw {idx} failed: {e}")
-                result = 0.0
-            p_success_simulated[idx] = float(result)
-            completed += 1
-            if completed % max(1, R // 10) == 0:
-                print(f"  Completed {completed}/{R} worker results...")
-    t1 = time.time()
-    print(f"Parallel MC done in {t1 - t0:.1f} s.")
 
-    # -----------------------
-    # Posterior predictive compound-Poisson AAL simulation
-    # -----------------------
+    print("Running parallel attack chain simulations...")
+    with ProcessPoolExecutor(max_workers=(N_WORKERS or multiprocessing.cpu_count())) as exe:
+        for i, res in enumerate(exe.map(worker_function, args_list)):
+            p_success_simulated[i] = res
+    print("Markov-chain simulation complete.")
+
+    # ---------- 8.3 Posterior predictive: compound loss by FAIR categories ----------
     rng_np = np.random.default_rng(RANDOM_SEED + 1)
-    annual_losses = np.zeros(R)
+    annual_losses = np.zeros(R, dtype=float)
     incident_counts = np.zeros(R, dtype=int)
-    cat_loss_matrix = np.zeros((R, NCAT))
+    cat_loss_matrix = np.zeros((R, len(loss_categories)), dtype=float)
 
     for i in range(R):
+        # Effective success rate per year (frequency × per-attempt success)
         lam_eff = lambda_draws[i] * p_success_simulated[i]
         n_succ = rng_np.poisson(lam_eff)
         incident_counts[i] = n_succ
         if n_succ == 0:
-            annual_losses[i] = 0.0
             continue
 
-        # severity: simple population-level defaults (no severity hyperparameters in this run)
-        sev_mu = 0.0
-        sev_sigma = 0.6
-        severities = rng_np.lognormal(mean=sev_mu, sigma=sev_sigma, size=n_succ)
+        # Incident-level severity multiplier (lognormal noise)
+        severities = rng_np.lognormal(mean=0.0, sigma=0.6, size=n_succ)
 
-        total_by_cat = np.zeros(NCAT)
+        # Primary categories: always-on bodies (lognormal) × severity
+        prod = np.sum(rng_np.lognormal(cat_mu[0], cat_sigma[0], size=n_succ) * severities)
+        resp = np.sum(rng_np.lognormal(cat_mu[1], cat_sigma[1], size=n_succ) * severities)
 
-        # Primary categories: always present (lognormal body * severity)
-        for c_idx, cat in enumerate(loss_categories):
-            if cat in ("Productivity", "ResponseContainment"):
-                body_draws = rng_np.lognormal(mean=cat_mu[c_idx], sigma=cat_sigma[c_idx], size=n_succ)
-                total_by_cat[c_idx] = np.sum(body_draws * severities)
+        # Secondary categories: zero-inflated + Pareto heavy tails
+        # (Here we trigger at most once per year for simplicity; extend to per-incident if needed.)
+        reg = 0.0
+        if rng_np.random() < 0.20:  # trigger probability for Regulatory/Legal
+            xm, alpha = pareto_defaults["RegulatoryLegal"]["xm"], pareto_defaults["RegulatoryLegal"]["alpha"]
+            reg = xm * (1.0 + rng_np.pareto(alpha))  # Pareto Type I shifted by xm
 
-        # Secondary: Regulatory
-        p_trig_reg = 0.2
-        p_tail_reg = 0.1
-        alpha_reg = pareto_defaults["RegulatoryLegal"]["alpha"]
-        xm_reg = pareto_defaults["RegulatoryLegal"]["xm"]
-        triggers_r = rng_np.random(n_succ) < p_trig_reg
-        if triggers_r.any():
-            idxs = np.nonzero(triggers_r)[0]
-            tail_flags = rng_np.random(len(idxs)) < p_tail_reg
-            if (~tail_flags).any():
-                body_count = (~tail_flags).sum()
-                body_samples = rng_np.lognormal(mean=cat_mu[IDX_REG], sigma=cat_sigma[IDX_REG], size=body_count)
-                total_by_cat[IDX_REG] += np.sum(body_samples * severities[idxs[~tail_flags]])
-            if tail_flags.any():
-                tail_count = tail_flags.sum()
-                tail_samples = draw_pareto(xm_reg, alpha_reg, size=tail_count, rng=rng_np)
-                total_by_cat[IDX_REG] += np.sum(tail_samples * severities[idxs[tail_flags]])
+        rep = 0.0
+        if rng_np.random() < 0.20:  # trigger probability for Reputation/Competitive
+            xm, alpha = pareto_defaults["ReputationCompetitive"]["xm"], pareto_defaults["ReputationCompetitive"]["alpha"]
+            rep = xm * (1.0 + rng_np.pareto(alpha))
 
-        # Secondary: Reputation
-        p_trig_rep = 0.2
-        p_tail_rep = 0.1
-        alpha_rep = pareto_defaults["ReputationCompetitive"]["alpha"]
-        xm_rep = pareto_defaults["ReputationCompetitive"]["xm"]
-        triggers_rep = rng_np.random(n_succ) < p_trig_rep
-        if triggers_rep.any():
-            idxs = np.nonzero(triggers_rep)[0]
-            tail_flags = rng_np.random(len(idxs)) < p_tail_rep
-            if (~tail_flags).any():
-                body_count = (~tail_flags).sum()
-                body_samples = rng_np.lognormal(mean=cat_mu[IDX_REP], sigma=cat_sigma[IDX_REP], size=body_count)
-                total_by_cat[IDX_REP] += np.sum(body_samples * severities[idxs[~tail_flags]])
-            if tail_flags.any():
-                tail_count = tail_flags.sum()
-                tail_samples = draw_pareto(xm_rep, alpha_rep, size=tail_count, rng=rng_np)
-                total_by_cat[IDX_REP] += np.sum(tail_samples * severities[idxs[tail_flags]])
+        cat_loss_matrix[i, :] = [prod, resp, reg, rep]
+        annual_losses[i] = prod + resp + reg + rep
 
-        cat_loss_matrix[i, :] = total_by_cat
-        annual_losses[i] = total_by_cat.sum()
 
-    # -----------------------
-    # Summaries
-    # -----------------------
+    # ---------- 8.4 Summaries: AAL and category credible intervals ----------
     mean_AAL = annual_losses.mean()
     median_AAL = np.median(annual_losses)
     p2_5, p97_5 = np.percentile(annual_losses, [2.5, 97.5])
@@ -429,7 +316,6 @@ def main():
     print("\nAAL posterior predictive summary (with fallback, severity, Pareto tails):")
     print(f"Mean AAL: ${mean_AAL:,.0f}")
     print(f"Median AAL: ${median_AAL:,.0f}")
-    # print(f"95% CI: [${p2_5:,.0f}, ${p97_5:,.0f}]")
     print(f"AAL 95% credible interval (annualized total loss): ${p2_5:,.0f} – ${p97_5:,.0f}")
     print(f"Mean successful incidents / year: {mean_incidents:.2f}")
     print(f"% years with zero successful incidents: {pct_zero:.1f}%\n")
@@ -440,127 +326,141 @@ def main():
         share_med = 100.0 * med / (median_AAL + 1e-12)
         print(f"  {cat:<24s} ${low:,.0f} – ${high:,.0f}  (median ${med:,.0f}, ≈{share_med:.1f}% of median AAL)")
 
-    # -----------------------
-    # Save CSV
-    # -----------------------
-    df = pd.DataFrame({
-        "lambda_draw": lambda_draws,
-        "p_success_sim": p_success_simulated,
-        "incident_count": incident_counts,
-        "annual_loss": annual_losses
-    })
-    for idx, cat in enumerate(loss_categories):
-        df[f"loss_{cat}"] = cat_loss_matrix[:, idx]
+    # ---------- 8.5 Visualization: original 2×2 grid + separate log-scale tail ----------
+    sns.set_style("whitegrid")
+    scale = 1e6 if PLOT_IN_MILLIONS else 1.0
+    scale_label = "Million USD" if PLOT_IN_MILLIONS else "USD"
 
-    csv_name = "posterior_predictive_aal_parallel_full_fixed.csv"
-    df.to_csv(csv_name, index=False)
-    print(f"\nSaved posterior predictive draws to '{csv_name}'")
-
-    # -----------------------
-    # Improved plotting with percentile annotations
-    # -----------------------
-    try:
-        import seaborn as sns
-        sns.set_style("whitegrid")
-    except Exception:
-        pass
-
-    def annotate_percentiles(ax, data, percentiles=(50, 90, 95, 99), label_y=0.9, scale=1.0, fmt="${:,.0f}"):
-        ys = ax.get_ylim()
-        y_annot = ys[1] * label_y
-        for p in percentiles:
-            val = np.percentile(data, p) / scale
-            ax.axvline(val, color='k', linestyle='--', linewidth=0.9, alpha=0.7)
-            ax.text(val, y_annot, f"P{p}={fmt.format(val)}", rotation=90, va='top', ha='center', fontsize=8, backgroundcolor='white')
-
-    # Prepare figure
+    # 2×2 Dashboard visualization
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-    # 1. Posterior λ
-    axes[0,0].hist(lambda_draws, bins=40, color='steelblue', alpha=0.85)
-    axes[0,0].set_title('Posterior λ (attacks/year)')
-    axes[0,0].set_xlabel('λ')
-    axes[0,0].set_ylabel('Frequency')
+    # (1) Posterior λ (attacks/year)
+    axes[0, 0].hist(lambda_draws, bins=40, color="steelblue", alpha=0.85)
+    axes[0, 0].set_title("Posterior λ (attacks/year)")
+    axes[0, 0].set_xlabel("λ")
+    axes[0, 0].set_ylabel("Frequency")
 
-    # 2. Per-attempt success probability (simulated)
-    axes[0,1].hist(p_success_simulated, bins=40, color='steelblue', alpha=0.85)
-    axes[0,1].set_title('Per-attempt success probability (simulated)')
-    axes[0,1].set_xlabel('Probability')
-    axes[0,1].set_ylabel('Frequency')
-    annotate_percentiles(axes[0,1], p_success_simulated, percentiles=(50,90,95,99), label_y=0.9, scale=1.0, fmt="{:,.3f}")
+    # (2) Per-attempt success probability (simulated)
+    axes[0, 1].hist(p_success_simulated, bins=40, color="steelblue", alpha=0.85)
+    axes[0, 1].set_title("Per-attempt success probability (simulated)")
+    axes[0, 1].set_xlabel("Probability")
+    axes[0, 1].set_ylabel("Frequency")
+    _annotate_percentiles(axes[0, 1], p_success_simulated, money=False)
 
-    # 3. Successful incidents per year
-    axes[1,0].hist(incident_counts, bins=range(0, max(incident_counts)+2), color='steelblue', alpha=0.85)
-    axes[1,0].set_title('Successful incidents / year (posterior predictive)')
-    axes[1,0].set_xlabel('Count')
-    axes[1,0].set_ylabel('Frequency')
-    annotate_percentiles(axes[1,0], incident_counts, percentiles=(50,90,95,99), label_y=0.9, scale=1.0, fmt="{:,.0f}")
+    # (3) Successful incidents per year
+    max_bins = max(int(incident_counts.max()) + 1, 10)
+    axes[1, 0].hist(incident_counts, bins=range(0, max_bins), color="steelblue", alpha=0.85)
+    axes[1, 0].set_title("Successful incidents / year (posterior predictive)")
+    axes[1, 0].set_xlabel("Count")
+    axes[1, 0].set_ylabel("Frequency")
+    _annotate_percentiles(axes[1, 0], incident_counts, money=False)
 
-    # 4. Annual Loss: truncated linear view (0.5–99th percentile)
+    # (4) Annual Loss — truncated linear view (0.5–99th percentile)
     nonzero = annual_losses[annual_losses > 0]
-    if len(nonzero) == 0:
-        axes[1,1].text(0.5, 0.5, "All annual losses are zero in draws", ha='center')
+    if len(nonzero) > 0:
+        low_lin, high_lin = np.percentile(nonzero, [0.5, 99.0])
+        mask = (annual_losses > low_lin) & (annual_losses < high_lin)
+        axes[1, 1].hist(annual_losses[mask] / scale, bins=80, color="steelblue", alpha=0.85)
+        axes[1, 1].set_title("Annual Loss (posterior predictive)\nTruncated 0.5–99th percentile")
+        axes[1, 1].set_xlabel(f"Annual Loss ({scale_label})")
+        axes[1, 1].set_ylabel("Frequency")
+        _annotate_percentiles(axes[1, 1], annual_losses[mask], scale=scale, money=True)
     else:
-        lowp, highp = np.percentile(nonzero, [0.5, 99.0])
-        mask = (annual_losses > lowp) & (annual_losses < highp)
-        scale = 1e6 if PLOT_IN_MILLIONS else 1.0
-        axes[1,1].hist(annual_losses[mask] / scale, bins=80, color='steelblue', alpha=0.85)
-        axes[1,1].set_title('Annual Loss (posterior predictive)\nTruncated 0.5–99th percentile')
-        axes[1,1].set_xlabel('Annual Loss (Million USD)' if PLOT_IN_MILLIONS else 'Annual Loss (USD)')
-        axes[1,1].set_ylabel('Frequency')
-        annotate_percentiles(axes[1,1], annual_losses[mask], percentiles=(50,90,95,99), label_y=0.9, scale=scale, fmt="${:,.0f}")
+        axes[1, 1].text(0.5, 0.5, "All draws are zero", ha="center", va="center")
 
     plt.tight_layout()
     plt.show()
 
-    # -----------------------
-    # Improved log-scale plot (auto-filter & log-space bins)
-    # -----------------------
-    if len(annual_losses[annual_losses > 0]) > 0:
-        nonzero = annual_losses[annual_losses > 0]
-        scale = 1e6 if PLOT_IN_MILLIONS else 1.0
-
-        # Detect dominance of small values
-        frac_small = np.mean(nonzero < 1e4)
-        # Compute robust range (trim 0.5–99.5 percentiles)
+    # Separate log-scale plot for heavy-tail view
+    if len(nonzero) > 0:
         low_p, high_p = np.percentile(nonzero, [0.5, 99.5])
-
-        # Filter only for visualization
         filtered = nonzero[(nonzero >= low_p) & (nonzero <= high_p)]
-        if len(filtered) < 10:
-            filtered = nonzero  # fallback: use all if filter removed too many
-
-        # Build log-spaced bins between filtered range
-        bins = np.logspace(np.log10(filtered.min()/scale),
-                        np.log10(filtered.max()/scale), 100)
+        filtered = filtered if len(filtered) >= 10 else nonzero
+        bins = np.logspace(np.log10(filtered.min() / scale), np.log10(filtered.max() / scale), 100)
 
         plt.figure(figsize=(8, 5))
-        plt.hist(filtered / scale, bins=bins, color='tomato', alpha=0.8)
-        plt.xscale('log')
-        plt.title('Annual Loss (posterior predictive) — log scale (auto-filtered)')
-        plt.xlabel('Annual Loss (Million USD, log scale)' if PLOT_IN_MILLIONS else 'Annual Loss (USD, log scale)')
-        plt.ylabel('Frequency')
-        plt.grid(True, which='both', ls='--', alpha=0.4)
-
-        # Annotate percentiles
-        def annotate_percentiles(ax, data, percentiles=(50, 90, 95, 99), scale=1.0):
-            for p in percentiles:
-                val = np.percentile(data, p) / scale
-                ax.axvline(val, color="k", linestyle="--", lw=0.8)
-                ax.text(val, ax.get_ylim()[1]*0.9, f"P{p}=${val:,.1f}", rotation=90,
-                        ha="center", va="top", fontsize=8, backgroundcolor="white")
-        annotate_percentiles(plt.gca(), filtered, percentiles=(50,90,95,99), scale=scale)
-
-        # Optional warning if dominated by near-zero values
-        if frac_small > 0.3:
-            plt.text(0.02, 0.9*plt.gca().get_ylim()[1],
-                    "⚠ Many near-zero values hidden for clarity",
-                    fontsize=9, color="gray")
-
+        plt.hist(filtered / scale, bins=bins, color="tomato", alpha=0.8)
+        plt.xscale("log")
+        plt.title("Annual Loss (posterior predictive) — log scale (auto-filtered)")
+        plt.xlabel(f"Annual Loss ({scale_label}, log scale)")
+        plt.ylabel("Frequency")
+        _annotate_percentiles(plt.gca(), filtered, scale=scale, money=True)
+        plt.grid(True, which="both", ls="--", alpha=0.35)
         plt.tight_layout()
         plt.show()
-    else:
-        print("No nonzero annual losses to plot on log scale.")
 
+    # ============================================================
+    # CSV EXPORTS
+    # ============================================================
+    import os, datetime, pandas as pd
+
+    # Export directory (same as script folder)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    # --- Detailed results export (all posterior draws) ---
+    outname = os.path.join(script_dir, f"cyber_risk_simulation_results_{timestamp}.csv")
+
+    df = pd.DataFrame({
+        "lambda_draw": lambda_draws,
+        "p_success": p_success_simulated,
+        "incidents": incident_counts,
+        "annual_loss": annual_losses,
+        **{cat: cat_loss_matrix[:, i] for i, cat in enumerate(loss_categories)}
+    })
+    df.to_csv(outname, index=False)
+    print(f"\n✅ Detailed results exported to {outname}")
+
+    # --- Summary statistics export (with % share of median AAL) ---
+    summary_data = []
+
+    # Overall AAL stats
+    summary_data.append({
+        "Category": "Total Annual Loss",
+        "Mean": np.mean(annual_losses),
+        "Median": np.median(annual_losses),
+        "CI_2.5%": np.percentile(annual_losses, 2.5),
+        "CI_97.5%": np.percentile(annual_losses, 97.5),
+        "Median Share of AAL (%)": 100.0
+    })
+
+    # Category stats with share of median AAL
+    median_AAL = np.median(annual_losses)
+    for i, cat in enumerate(loss_categories):
+        vals = cat_loss_matrix[:, i]
+        med_val = np.median(vals)
+        mean_val = np.mean(vals)
+        ci_low, ci_high = np.percentile(vals, [2.5, 97.5])
+        share_med = 100.0 * med_val / (median_AAL + 1e-12)
+        summary_data.append({
+            "Category": cat,
+            "Mean": mean_val,
+            "Median": med_val,
+            "CI_2.5%": ci_low,
+            "CI_97.5%": ci_high,
+            "Median Share of AAL (%)": share_med
+        })
+
+    summary_df = pd.DataFrame(summary_data)
+    summary_name = os.path.join(script_dir, f"cyber_risk_simulation_summary_{timestamp}.csv")
+    summary_df.to_csv(summary_name, index=False)
+    print(f"✅ Summary statistics exported to {summary_name}\n")
+
+    # ============================================================
+    # Return dictionary for programmatic reuse
+    # ============================================================
+    return {
+        "lambda_draws": lambda_draws,
+        "p_success_simulated": p_success_simulated,
+        "incident_counts": incident_counts,
+        "annual_losses": annual_losses,
+        "cat_loss_matrix": cat_loss_matrix,
+    }
+
+
+
+# =============================================================================
+# 9) ENTRY POINT — Purpose: safe multiprocessing on all OSes
+# =============================================================================
 if __name__ == "__main__":
-    main()
+    results = main()
