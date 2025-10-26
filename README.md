@@ -19,6 +19,6 @@ Sample Output:
 
 <img width="1088" height="976" alt="Screenshot From 2025-10-25 21-35-23" src="https://github.com/user-attachments/assets/f9c6eb92-71af-4ae2-b91a-9351ffb360ad" />
 
-<img width="1400" height="1000" alt="Figure_1" src="https://github.com/user-attachments/assets/53b82d52-3bba-45e6-a94a-1dfebef89c36" />
+<img width="1400" height="1000" alt="Figure_1" src="https://github.com/user-attachments/assets/bcb2a86f-8ddc-40bd-850d-5e281363004e" />
 
-<img width="800" height="500" alt="Figure_2" src="https://github.com/user-attachments/assets/62f49c11-e6d0-45f0-9bf9-661e77af6a38" />
+<img width="800" height="500" alt="Figure_2" src="https://github.com/user-attachments/assets/caeae889-29ac-4272-9f83-8feed463254a" />
