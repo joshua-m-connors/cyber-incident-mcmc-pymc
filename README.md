@@ -23,7 +23,7 @@ You can use either the .py file or if you prefer Jupyter notebooks you can use t
 ## Sample Output:
 
 
-The code also outputs two CSV files, to the same directory the .py file is save in, that includes the summary statistics and the full simulation data for every draw.
+The code also outputs two CSV files, to the same directory the .py file is save in, that includes the summary statistics and the full annualized simulation data for each draw.
 
 
 <img width="1070" height="506" alt="Screenshot From 2025-10-27 08-47-32" src="https://github.com/user-attachments/assets/937dbe39-152d-4634-b39b-784dca72cc5a" />
