@@ -22,8 +22,12 @@ Acknowledgements:
 
 Sample Output:
 
-<img width="1084" height="490" alt="Screenshot From 2025-10-26 13-35-00" src="https://github.com/user-attachments/assets/821de248-64b1-4956-aa6e-ee9abea5e3b3" />
 
-<img width="1500" height="1000" alt="Figure_1" src="https://github.com/user-attachments/assets/cc62637e-16df-4d4f-8a45-715281681cc1" />
+<img width="1070" height="506" alt="Screenshot From 2025-10-27 08-47-32" src="https://github.com/user-attachments/assets/937dbe39-152d-4634-b39b-784dca72cc5a" />
 
-<img width="800" height="500" alt="Figure_2" src="https://github.com/user-attachments/assets/d70c75fe-79b2-49e6-9169-a303be566dc2" />
+
+<img width="1500" height="1000" alt="Figure_1" src="https://github.com/user-attachments/assets/09417354-2230-461d-a7bf-b5cd38fff909" />
+
+
+<img width="800" height="500" alt="Figure_2" src="https://github.com/user-attachments/assets/edf216cf-1d7d-49bc-9f32-a0e37cc5669f" />
+
