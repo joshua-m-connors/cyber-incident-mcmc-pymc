@@ -34,3 +34,12 @@ The code also outputs two CSV files, to the same directory the .py file is save 
 
 <img width="800" height="500" alt="Figure_2" src="https://github.com/user-attachments/assets/edf216cf-1d7d-49bc-9f32-a0e37cc5669f" />
 
+### MITRE ATT&CK Tactics Progression
+
+This is intended to show attackers progression through the MITRE ATT&CK tactics, so you can see how far attackers are getting, where controls may be more effective at stopping attackers, etc.
+Note: I have only implemented this view into the Jupyter Notebook verion of the code.
+
+
+<img width="1220" height="1266" alt="Screenshot From 2025-10-27 09-55-10" src="https://github.com/user-attachments/assets/9fdf7aa0-f32d-4417-bde2-a7782528dc35" />
+
+
