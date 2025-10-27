@@ -1,12 +1,12 @@
 Cyber Incident Estimation utilizing Markov Chain Monte Carlo (MCMC) simulation
 
-This code takes an initial (prior) estimate of the frequency of attacks against an organization. This range would be similar to Threat Event Frequency (TEF) in the Factor Analysis of Information Risk (FAIR) taxonomy.
+This code takes an initial (prior) estimate of the frequency of attacks against an organization. This range would be similar to Threat Event Frequency (TEF) in the Factor Analysis of Information Risk (FAIR) taxonomy, but likely a bit higher (analysts likely weed out or are unaware of many attacks that fail early on).
 
-Note: There is an option (lines 37 & 38) to enter actual observational data (i.e. if you know there were 2 successful incidents in the past year you can enter that in line 38).
+Note: There is an option (lines 270 & 271) to enter actual observational data (i.e. if you know there were 2 successful incidents in the past 3 year).
 
 It then simulates each attack as it progresses through the relevant MITRE ATT&CK tactics. Each tactic has an individually estimated range of control strength that gets applied. There is also logic that assumes that when an attacker fails with a tactic, they may retry and/or fallback and try a different path. However, as they fallback and try different techniques the chance of being discovered or blocked increases.
 
-The result is then an posterior projection of the number of successful attacks that will actually get through the entire attack process. These are then combined with estimates of loss aligned to FAIR loss categories to compute Annual Loss.
+The result is then an posterior projection of the number of successful attacks that will actually get through the entire attack process to full compromise. These are then combined with estimates of loss aligned to FAIR loss categories to compute Annualized Loss Expectancy (ALE).
 
 Running the code:
 
@@ -14,7 +14,7 @@ You can use either the .py file or if you prefer Jupyter notebooks you can use t
 
 Requires:
 - Python
-- PyMC (Recommended to install using Anaconda)
+- PyMC (Recommended to install using Anaconda: https://www.pymc.io/projects/docs/en/latest/installation.html#)
 - Jupyer Notebooks (optional)
 
 Acknowledgements:
