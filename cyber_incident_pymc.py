@@ -132,10 +132,10 @@ loss_categories = ["Productivity", "ResponseContainment", "RegulatoryLegal", "Re
 
 # Elicited 90% intervals per category (USD)
 loss_q5_q95 = {
-    "Productivity": (10_000, 150_000),
-    "ResponseContainment": (20_000, 500_000),
-    "RegulatoryLegal": (0, 2_000_000),
-    "ReputationCompetitive": (0, 5_000_000),
+    "Productivity": (10_000, 500_000),
+    "ResponseContainment": (20_000, 1_500_000),
+    "RegulatoryLegal": (0, 20_000_000),
+    "ReputationCompetitive": (0, 10_000_000),
 }
 
 def _lognormal_from_q5_q95(q5: float, q95: float):
@@ -335,15 +335,22 @@ def main():
         resp = np.sum(rng_np.lognormal(cat_mu[1], cat_sigma[1], size=n_succ) * severities)
 
         # Secondary categories: zero-inflated + Pareto heavy tails
-        reg = 0.0
-        if rng_np.random() < 0.20:
-            xm, alpha = pareto_defaults["RegulatoryLegal"]["xm"], pareto_defaults["RegulatoryLegal"]["alpha"]
-            reg = xm * (1.0 + rng_np.pareto(alpha))
+        # --- Per-incident heavy-tail triggers correlated with severity ---
 
+        tail_trigger_prob = 0.10  # 10% chance PER INCIDENT for each category
+        reg = 0.0
         rep = 0.0
-        if rng_np.random() < 0.20:
-            xm, alpha = pareto_defaults["ReputationCompetitive"]["xm"], pareto_defaults["ReputationCompetitive"]["alpha"]
-            rep = xm * (1.0 + rng_np.pareto(alpha))
+
+        for s in range(n_succ):
+            sev = severities[s]
+
+            if rng_np.random() < tail_trigger_prob:
+                xm, alpha = pareto_defaults["RegulatoryLegal"]["xm"], pareto_defaults["RegulatoryLegal"]["alpha"]
+                reg += (xm * (1.0 + rng_np.pareto(alpha))) * (1.0 + sev)**1.2
+
+            if rng_np.random() < tail_trigger_prob:
+                xm, alpha = pareto_defaults["ReputationCompetitive"]["xm"], pareto_defaults["ReputationCompetitive"]["alpha"]
+                rep += (xm * (1.0 + rng_np.pareto(alpha))) * (1.0 + sev)**1.2
 
         cat_loss_matrix[i, :] = [prod, resp, reg, rep]
         annual_losses[i] = prod + resp + reg + rep
