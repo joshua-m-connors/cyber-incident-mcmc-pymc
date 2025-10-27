@@ -8,9 +8,14 @@ It then simulates each attack as it progresses through the relevant MITRE ATT&CK
 
 The result is then an posterior projection of the number of successful attacks that will actually get through the entire attack process. These are then combined with estimates of loss aligned to FAIR loss categories to compute Annual Loss.
 
+Running the code:
+
+You can use either the .py file or if you prefer Jupyter notebooks you can use the .ipynb file.
+
 Requires:
 - Python
-- PyMC
+- PyMC (Recommended to install using Anaconda)
+- Jupyer Notebooks (optional)
 
 Acknowledgements:
 - I got a lot of help on this from Claude and ChatGPT.
