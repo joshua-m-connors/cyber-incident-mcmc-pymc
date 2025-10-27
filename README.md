@@ -14,7 +14,7 @@ You can use either the .py file or if you prefer Jupyter notebooks you can use t
 
 Requires:
 - Python
-- PyMC (Recommended to install using Anaconda: https://www.pymc.io/projects/docs/en/latest/installation.html#)
+- PyMC (Recommended installation using Anaconda: https://www.pymc.io/projects/docs/en/latest/installation.html#)
 - Jupyer Notebooks (optional)
 
 Acknowledgements:
