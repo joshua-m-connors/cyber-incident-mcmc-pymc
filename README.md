@@ -10,7 +10,7 @@ The result is then an posterior projection of the number of successful attacks t
 
 ## Running the code:
 
-You can use either the .py file or if you prefer Jupyter notebooks you can use the .ipynb file.
+You can use either the .py file or if you prefer Jupyter Notebooks you can use the .ipynb file.
 
 Note: The Jupyter Notebook version of the code is dialed back to run fewer simulations, this is because Jupyter Notebooks won't always play nice with the parallelization that is implemented in the .py version.
 
