@@ -12,6 +12,8 @@ The result is then an posterior projection of the number of successful attacks t
 
 You can use either the .py file or if you prefer Jupyter notebooks you can use the .ipynb file.
 
+Note: The Jupyter Notebook version of the code is dialed back to run fewer simulations, this is because Jupyter Notebooks won't always play nice with the parallelization that is implemented in the .py version.
+
 ## Requires:
 - Python
 - PyMC (Recommended installation using Anaconda: https://www.pymc.io/projects/docs/en/latest/installation.html#)
@@ -37,7 +39,8 @@ The code also outputs two CSV files, to the same directory the .py file is save 
 ### MITRE ATT&CK Tactics Progression
 
 This is intended to show attackers progression through the MITRE ATT&CK tactics, so you can see how far attackers are getting, where controls may be more effective at stopping attackers, etc.
-Note: I have only implemented this view into the Jupyter Notebook version of the code.
+
+Note: I have only implemented this view into the Jupyter Notebook version of the code, due to the extended time it takes to gather these statistics.
 
 
 <img width="1220" height="1266" alt="Screenshot From 2025-10-27 09-55-10" src="https://github.com/user-attachments/assets/9fdf7aa0-f32d-4417-bde2-a7782528dc35" />
