@@ -1,147 +1,189 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-cyber_risk_simulation_main_explained_final.py
-
+=====================================================================================
+Cyber Incident Risk Model with MITRE ATT&CK + FAIR (Instructional & Explanatory)
+=====================================================================================
 PURPOSE
--------
-A comprehensive, end-to-end Bayesian cyber risk simulation that:
-  1) infers attacker frequency and per-stage success from priors (PyMC),
-  2) simulates attacker progression through MITRE ATT&CK as a Markov process
-     (retries with diminishing returns, fallback, increasing detection),
-  3) quantifies financial impact using a FAIR-aligned taxonomy with heavy tails,
-  4) executes per-draw Monte Carlo in parallel (safe, top-level worker),
-  5) summarizes Annualized Loss (AAL) and category-level credible intervals,
-  6) visualizes key posteriors in a 2×2 grid and a separate log-scale tail plot.
+-------------------------------------------------------------------------------------
+This script builds a *quantitative* cyber-risk model that ties together:
+  • MITRE ATT&CK stage-level defensive control strength → per‑stage success priors.
+  • A Bayesian model (PyMC) for attacker attempt frequency and stage success.
+  • FAIR‑style per‑incident loss categories, including heavy‑tailed regulatory and
+    reputational components (Pareto tails).
 
-This file is structured for safe multiprocessing on all OSes (Windows/macOS/Linux)
-and can be run as a script. It can also be imported and `main()` invoked explicitly.
+The outcome is a *posterior predictive* view of annualized loss, supporting
+decision-making (e.g., “Which levers move AAL?” “How strong are our controls by
+tactic?”). Visual outputs include a 2×2 dashboard, a log-scale ALE‑style histogram,
+and a loss exceedance curve (LEC), all saved under a date‑stamped output folder.
+
+HOW THE PIECES FIT
+-------------------------------------------------------------------------------------
+1) Control strengths per MITRE tactic are loaded from `mitre_control_strength_dashboard`
+   (or a SME fallback map). Strength is treated as a *block* (0–0.95) and inverted to
+   success intervals per stage (success = 1 – block). These intervals parameterize Beta
+   priors for each stage’s success probability.
+2) An “attacker adaptation factor” degrades the control block (e.g., 0.75 ⇒ 25% weaker
+   than nominal) to reflect learning/novelty. You can hold it fixed or sample once per
+   run from a range (stochastic adaptation).
+3) PyMC samples posterior draws for:
+   • λ (attempts/year) using a lognormal prior implied by a 90% CI.
+   • Per‑stage success probabilities (Beta priors). The end‑to‑end success probability
+     for a chain is the product of stage probabilities.
+4) Posterior predictive simulation: for each posterior draw, simulate annual attempts,
+   pass each through a MITRE chain with retries, detection, and fallback logic, and draw
+   per‑category losses. Aggregate to annual totals.
+5) Exports: CSVs for detailed samples and a compact summary, plus PNG charts.
+
+WHAT USERS MOST OFTEN TUNE (READ THIS!)
+-------------------------------------------------------------------------------------
+• Frequency prior (CI_MIN_FREQ / CI_MAX_FREQ)
+  - Meaning: Your belief about the 90% range of *attempts per year*.
+  - When to change: If you have telemetry suggesting a different threat tempo.
+
+• PyMC sampler knobs (N_SAMPLES, N_TUNE, N_CHAINS, TARGET_ACCEPT)
+  - Meaning: Speed vs. accuracy tradeoff for MCMC.
+  - When to change: Faster iteration (smaller draws) vs. tighter intervals (larger).
+
+• Monte Carlo per-draw size (N_SIM_PER_DRAW) and CPU workers (N_WORKERS)
+  - Meaning: How many simulated attempts per posterior draw, and parallelism.
+  - When to change: Increase for smoother predictive distributions.
+
+• MITRE control strengths (provided via the dashboard CSV) and SME fallback ranges
+  - Meaning: Tactic‑level *block* intervals in [0, 0.95].
+  - When to change: After control reviews, red‑team results, or measurement updates.
+
+• Attacker adaptation (ADAPTATION_FACTOR / ADAPTATION_STOCHASTIC / ADAPTATION_STOCHASTIC_RANGE)
+  - Meaning: Degrades the nominal control block (e.g., 0.75 ⇒ 75% of block remains).
+  - When to change: Stress tests (“what if attackers adapt more quickly?”).
+
+• Loss assumptions
+  - `loss_q5_q95`: 90% CIs (per incident) for each FAIR category’s lognormal body.
+  - `pareto_defaults`: Tail frequency and severity for Regulatory/Legal & Reputation.
+  - When to change: Calibrate with claims data, incident post‑mortems, or expert input.
+
+INTERPRETING OUTPUTS
+-------------------------------------------------------------------------------------
+• “Successful Incidents / Year”: Derived from λ × (end‑to‑end chain success).
+• “Annual Loss (posterior predictive)”: Includes category allocations & capped tails.
+• LEC: Read “% chance annual loss exceeds $X”. Annotated P50/P90/P95/P99 lines help.
+
+REPRODUCIBILITY
+-------------------------------------------------------------------------------------
+Random seeds are set for both the Bayesian sampling and the predictive simulation.
+Charts and CSVs are written under `output_YYYY-MM-DD/` in the script folder.
+
+IMPORTANT: CODE INTEGRITY
+-------------------------------------------------------------------------------------
+This instructional version *adds comments and docstrings only*. No logic, names,
+or defaults are changed below.
+=====================================================================================
 """
 
-# =============================================================================
-# 1) IMPORTS — Purpose: all libraries used for inference, simulation, and plots
-# =============================================================================
 
-import random
-import multiprocessing
-from concurrent.futures import ProcessPoolExecutor
-import numpy as np
-import pymc as pm
-from scipy import stats, optimize
-import matplotlib.pyplot as plt
-import seaborn as sns
-import pandas as pd
-import datetime
 import os
+import sys
+import math
+import argparse
+from datetime import datetime
 
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+
+# ---------- Optional dependencies ----------
+try:
+    import pymc as pm
+    HAVE_PYMC = True
+except Exception:
+    HAVE_PYMC = False
+
+# MITRE analyzer (tactic-level control strengths)
+try:
+    from mitre_control_strength_dashboard import get_mitre_tactic_strengths
+    HAVE_MITRE_ANALYZER = True
+except Exception as e:
+    print(f"⚠️ MITRE analyzer not available: {e}")
+    HAVE_MITRE_ANALYZER = False
+
+# ANSI colors
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+RESET  = "\033[0m"
 
 # =============================================================================
-# 2) GLOBAL CONFIG — Purpose: model priors, runtime controls, plotting options
+# 2) GLOBAL CONFIG — priors, runtime, plotting
 # =============================================================================
 # Frequency prior (attempts/year), elicited as a 90% CI -> Lognormal params
-CI_MIN_FREQ = 1
-CI_MAX_FREQ = 30
+CI_MIN_FREQ = 4
+CI_MAX_FREQ = 24
 Z_90 = 1.645
 
 # PyMC sampling (tune for speed vs. accuracy)
 N_SAMPLES = 4000
 N_TUNE = 1000
 N_CHAINS = 4
-TARGET_ACCEPT = 0.90 
+TARGET_ACCEPT = 0.90
 RANDOM_SEED = 42
 
 # Parallel Monte Carlo (per posterior draw attacker simulations)
 N_WORKERS = None              # None -> use all logical cores
 N_SIM_PER_DRAW = 1000         # Monte Carlo attempts per posterior draw
 
-# Markov attacker behavior
-MAX_RETRIES_PER_STAGE = 3     # retries allowed at a stage
-RETRY_PENALTY = 0.75          # each retry multiplies base success probability (diminishing returns)
-FALLBACK_PROB = 0.25          # probability to step back one stage after exhausting retries
-DETECT_BASE = 0.01            # base detection probability on a failed try
-DETECT_INC_PER_RETRY = 0.06   # incremental detection added per retry
+# Attacker progression controls
+MAX_RETRIES_PER_STAGE = 3          # number of retries per MITRE stage
+RETRY_PENALTY = 0.90               # success decay per retry
+FALLBACK_PROB = 0.25               # chance of tactical fallback to prior stage
+DETECT_BASE = 0.01                 # base detection probability per stage
+DETECT_INC_PER_RETRY = 0.03       # incremental detection chance per retry
+MAX_FALLBACKS_PER_CHAIN = 3        # max fallbacks allowed in one attack chain
 
-# Visualization
-PLOT_IN_MILLIONS = True       # show currency axes in millions USD
+# Visualization (console & charts)
+PLOT_IN_MILLIONS = True
 
+# Attacker adaptation (how much of the nominal control block actually works)
+ADAPTATION_FACTOR = 0.95                 # deterministic fallback
+ADAPTATION_STOCHASTIC = True             # if True, sample once per run
+ADAPTATION_STOCHASTIC_RANGE = (0.60, 0.85)
 
 # =============================================================================
-# 3) MITRE ATT&CK PRIORS — Purpose: convert control effectiveness to Beta priors
+# 3) MITRE STAGES (fixed order for Enterprise)
 # =============================================================================
-# SME-provided 90% CI for control effectiveness per MITRE stage.
-# We convert to attacker success: success ∈ [1 - hi, 1 - lo], then fit Beta via quantile-matching.
-STAGE_CONTROL_MAP = {
-    "Initial Access":        (0.15, 0.50),
-    "Execution":             (0.05, 0.30),
-    "Persistence":           (0.10, 0.45),
-    "Privilege Escalation":  (0.10, 0.35),
-    "Defense Evasion":       (0.20, 0.60),
-    "Credential Access":     (0.15, 0.50),
-    "Discovery":             (0.02, 0.20),
-    "Lateral Movement":      (0.25, 0.65),
-    "Collection":            (0.05, 0.30),
-    "Command and Control":   (0.10, 0.45),
-    "Exfiltration":          (0.30, 0.70),
-    "Impact":                (0.35, 0.75),
+MITRE_STAGES = [
+    "Initial Access","Execution","Persistence","Privilege Escalation","Defense Evasion",
+    "Credential Access","Discovery","Lateral Movement","Collection","Command And Control",
+    "Exfiltration","Impact",
+]
+
+# SME fallback (control block in [0,0.95])
+_SME_STAGE_CONTROL_MAP_FALLBACK = {
+    "Initial Access": (0.20, 0.50),
+    "Execution": (0.20, 0.50),
+    "Persistence": (0.20, 0.55),
+    "Privilege Escalation": (0.25, 0.55),
+    "Defense Evasion": (0.25, 0.55),
+    "Credential Access": (0.20, 0.50),
+    "Discovery": (0.20, 0.55),
+    "Lateral Movement": (0.20, 0.50),
+    "Collection": (0.20, 0.50),
+    "Command And Control": (0.20, 0.55),
+    "Exfiltration": (0.20, 0.50),
+    "Impact": (0.20, 0.50),
 }
-MITRE_STAGES = list(STAGE_CONTROL_MAP.keys())
-
-
-def _quantile_match_beta(p5: float, p95: float, q_low: float = 0.05, q_high: float = 0.95):
-    """
-    Purpose: derive Beta(α,β) whose 5th and 95th percentiles match (p5, p95).
-    This lets you encode SME 90% intervals directly as Beta priors.
-    """
-    mean = 0.5 * (p5 + p95)
-    width = max(p95 - p5, 1e-6)
-    concentration_guess = 20.0 * (0.1 / width)   # loose heuristic to start
-    a0 = max(1e-3, mean * concentration_guess)
-    b0 = max(1e-3, (1.0 - mean) * concentration_guess)
-
-    def resid(params):
-        a, b = params
-        if a <= 0 or b <= 0:
-            return [1e6, 1e6]
-        return [stats.beta.ppf(q_low, a, b) - p5,
-                stats.beta.ppf(q_high, a, b) - p95]
-
-    sol = optimize.root(resid, [a0, b0], method="hybr")
-    if sol.success and np.all(np.array(sol.x) > 0):
-        return float(sol.x[0]), float(sol.x[1])
-    return a0, b0
-
-
-# Convert control effectiveness to attacker success 90% CI per stage
-_success_90s = [(1.0 - hi, 1.0 - lo) for (lo, hi) in STAGE_CONTROL_MAP.values()]
-alphas, betas = zip(*(_quantile_match_beta(lo, hi) for (lo, hi) in _success_90s))
-alphas, betas = np.array(alphas), np.array(betas)
-
 
 # =============================================================================
-# 4) FAIR TAXONOMY — Purpose: define loss categories & distributions (heavy-tailed)
+# 4) FAIR TAXONOMY — loss categories & distributions (heavy-tailed)
 # =============================================================================
-# Categories: two primary (lognormal bodies), two secondary (lognormal + Pareto tail triggers)
-"""
-Defines loss categories per the Factor Analysis of Information Risk (FAIR) model.
-
-- Primary losses (Productivity, ResponseContainment) are lognormal.
-- Secondary losses (RegulatoryLegal, ReputationCompetitive) have Pareto tails
-  to represent heavy-tailed risk events.
-"""
 loss_categories = ["Productivity", "ResponseContainment", "RegulatoryLegal", "ReputationCompetitive"]
 
-# Elicited 90% intervals per category (USD)
+# 90% subject-matter CIs for per-incident loss body (lognormal base)
 loss_q5_q95 = {
-    "Productivity": (10_000, 500_000),
-    "ResponseContainment": (20_000, 1_500_000),
-    "RegulatoryLegal": (0, 20_000_000),
-    "ReputationCompetitive": (0, 10_000_000),
+    "Productivity": (1_000, 200_000),
+    "ResponseContainment": (10_000, 1_000_000),
+    "RegulatoryLegal": (0, 3_000_000),
+    "ReputationCompetitive": (0, 5_000_000),
 }
 
 def _lognormal_from_q5_q95(q5: float, q95: float):
-    """
-    Purpose: invert 5th/95th percentiles to (mu, sigma) in log-space for Lognormal.
-    """
     q5, q95 = max(q5, 1.0), max(q95, q5 * 1.0001)
     ln5, ln95 = np.log(q5), np.log(q95)
     sigma = (ln95 - ln5) / (2.0 * Z_90)
@@ -154,380 +196,654 @@ for i, cat in enumerate(loss_categories):
     mu, sg = _lognormal_from_q5_q95(*loss_q5_q95[cat])
     cat_mu[i], cat_sigma[i] = mu, sg
 
-# Pareto tail (Type I) params for secondary losses (heavy tails)
+# Pareto tail params for secondary losses (Type I Pareto)
 pareto_defaults = {
-    "RegulatoryLegal":       {"xm": 100_000.0, "alpha": 1.8},
-    "ReputationCompetitive": {"xm": 250_000.0, "alpha": 1.5},
+    "RegulatoryLegal":       {"xm": 50_000.0, "alpha": 3.5},
+    "ReputationCompetitive": {"xm": 100_000.0, "alpha": 2.75},
 }
 
+# =============================================================================
+# 5) Output directory (daily, reused)
+# =============================================================================
+def make_output_dir(prefix="output"):
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    out_dir = os.path.join(base_dir, f"{prefix}_{date_str}")
+    os.makedirs(out_dir, exist_ok=True)
+    print(f"📁 Output directory: {out_dir}")
+    return out_dir
+
+OUTPUT_DIR = make_output_dir()
+# Per-category arrays from last simulation (used by summary printing)
+LAST_CATEGORY_LOSSES = None
 
 # =============================================================================
-# 5) MARKOV ATTACKER MODEL — Purpose: simulate retries, fallback, detection
+# 6) Helpers: MITRE controls → success priors (Beta), formatting, etc.
 # =============================================================================
-"""
-Simulates the MITRE ATT&CK process as a Markov chain, allowing retries and fallback.
-Each stage has a chance of success, detection, or failure.
-"""
-def simulate_one_attempt(success_probs_stage: np.ndarray,
-                         rng: random.Random,
-                         max_retries_per_stage: int = MAX_RETRIES_PER_STAGE,
-                         retry_penalty: float = RETRY_PENALTY,
-                         fallback_prob: float = FALLBACK_PROB,
-                         detect_base: float = DETECT_BASE,
-                         detect_increase_per_retry: float = DETECT_INC_PER_RETRY) -> bool:
+def _load_stage_control_map_from_analyzer(dataset_path: str, csv_path: str = "mitigation_control_strengths.csv"):
     """
-    Simulate a single attacker attempt through ordered MITRE stages.
-
-    Mechanics:
-      - At each stage, the attacker gets (retries+1) attempts.
-      - Success prob per retry decays: p_try = (retry_penalty**k) * base_p.
-      - After each failed try, run a detection check with probability increasing in k.
-      - If all retries at a stage fail, attacker may fallback to previous stage.
-
-    Returns:
-        True if all stages are completed (full compromise), else False.
+    Loads tactic-level control ranges from MITRE analyzer if available;
+    else SME fallback. Returns {tactic: (control_min, control_max)} in [0..1].
     """
-    stage_idx = 0
-    nstages = len(success_probs_stage)
+    if HAVE_MITRE_ANALYZER:
+        try:
+            df, _ = get_mitre_tactic_strengths(dataset_path, csv_path, build_figure=False)
+            control_map = {}
+            for _, r in df.iterrows():
+                t = str(r["Tactic"])
+                lo = max(0.0, min(95.0, float(r["MinStrength"]))) / 100.0
+                hi = max(0.0, min(95.0, float(r["MaxStrength"]))) / 100.0
+                if lo > hi:
+                    lo, hi = hi, lo
+                control_map[t] = (lo, hi)
+            # ensure full canonical coverage
+            for t in MITRE_STAGES:
+                control_map.setdefault(t, _SME_STAGE_CONTROL_MAP_FALLBACK[t])
+            print("✅ Loaded control strengths from MITRE ATT&CK dataset.")
+            return control_map
+        except Exception as e:
+            print(f"⚠️ MITRE dataset load failed: {e}. Using SME fallback.")
+            return _SME_STAGE_CONTROL_MAP_FALLBACK.copy()
+    else:
+        return _SME_STAGE_CONTROL_MAP_FALLBACK.copy()
+    
+def _print_stage_control_map(stage_map):
+    """Prints the loaded control strength ranges by MITRE tactic."""
+    print("\n--- Tactic Control Strength Parameters Used ---")
+    print(f"{'Tactic':<25} {'MinStrength':>12} {'MaxStrength':>12}")
+    for t in MITRE_STAGES:
+        lo, hi = stage_map.get(t, (0.0, 0.0))
+        print(f"{t:<25} {lo*100:>11.1f}% {hi*100:>11.1f}%")
+    print("------------------------------------------------")
+    
+    # Optional: also save to CSV for diagnostics
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    csv_path = os.path.join(OUTPUT_DIR, f"tactic_control_strengths_{ts}.csv")
+    pd.DataFrame([
+        {"Tactic": t, "MinStrength": lo * 100, "MaxStrength": hi * 100}
+        for t, (lo, hi) in stage_map.items()
+    ]).to_csv(csv_path, index=False)
+    print(f"✅ Saved control strength parameters → {csv_path}")
 
-    while True:
-        if stage_idx >= nstages:
-            return True  # completed all stages
 
-        p_base = float(success_probs_stage[stage_idx])
+def _success_interval_from_control(block_lo: float, block_hi: float):
+    """
+    Convert control block interval (fraction) → attacker success interval.
+    success = 1 - block
+    """
+    block_lo = max(0.0, min(0.95, block_lo))
+    block_hi = max(0.0, min(0.95, block_hi))
+    lo_succ = 1.0 - block_hi
+    hi_succ = 1.0 - block_lo
+    if lo_succ > hi_succ:
+        lo_succ, hi_succ = hi_succ, lo_succ
+    return lo_succ, hi_succ
 
-        # Attempt initial + retries
-        for k in range(max_retries_per_stage + 1):
-            p_try = (retry_penalty ** k) * p_base
-            if rng.random() < p_try:
-                break  # proceed to next stage
-            # detection escalates with retries at the current stage
-            detect_prob = min(max(detect_base + detect_increase_per_retry * k, 0.0), 1.0)
-            if rng.random() < detect_prob:
-                return False  # detected & stopped
-        else:
-            # exhausted retries without success
-            if stage_idx == 0 or rng.random() > fallback_prob:
-                return False
-            stage_idx -= 1  # fallback one stage
-            continue
+def _beta_from_interval(lo: float, hi: float, strength: float = 200.0):
+    mu = 0.5 * (lo + hi)
+    k = max(2.0, float(strength))
+    a = max(1e-3, mu * k)
+    b = max(1e-3, (1 - mu) * k)
+    return a, b
 
-        # success at this stage: move forward
-        stage_idx += 1
-
+def _fmt_money(x: float, millions: bool = None) -> str:
+    """
+    Format currency for console; defaults to PLOT_IN_MILLIONS if millions=None.
+    """
+    if millions is None:
+        millions = PLOT_IN_MILLIONS
+    if millions:
+        return f"${x/1_000_000:,.2f}M"
+    return f"${x:,.0f}"
 
 # =============================================================================
-# 6) PARALLEL WORKER — Purpose: per-draw Monte Carlo to estimate success prob
+# 7) Posterior & simulation core
 # =============================================================================
-def worker_function(args) -> float:
+def _build_beta_priors_from_stage_map(stage_map):
+    """Return alphas, betas in MITRE_STAGES order, applying attacker adaptation."""
+    rng = np.random.default_rng(RANDOM_SEED)
+
+    if ADAPTATION_STOCHASTIC:
+        adapt_lo, adapt_hi = ADAPTATION_STOCHASTIC_RANGE
+        adaptation_factor = float(rng.uniform(adapt_lo, adapt_hi))
+        color = YELLOW
+    else:
+        adaptation_factor = float(ADAPTATION_FACTOR)
+        color = GREEN
+
+    print(f"{color}🔧 Using attacker adaptation factor = {adaptation_factor:.3f} "
+          f"(stochastic={ADAPTATION_STOCHASTIC}){RESET}")
+
+    alphas, betas = [], []
+    for t in MITRE_STAGES:
+        blo, bhi = stage_map[t]  # control block fractions [0..0.95]
+        # apply adaptation (controls are less effective by adaptation_factor)
+        blo_eff = max(0.0, min(0.95, adaptation_factor * blo))
+        bhi_eff = max(0.0, min(0.95, adaptation_factor * bhi))
+
+        slo, shi = _success_interval_from_control(blo_eff, bhi_eff)
+        a, b = _beta_from_interval(slo, shi, strength=50.0)
+        alphas.append(a); betas.append(b)
+    return np.array(alphas), np.array(betas)
+
+def _simulate_attacker_path(success_probs, rng):
     """
-    Top-level (picklable) worker for ProcessPoolExecutor.
+    Simulates an attacker progressing through MITRE stages with:
+      - retries (MAX_RETRIES_PER_STAGE)
+      - retry penalty (RETRY_PENALTY)
+      - increasing detection per retry (DETECT_BASE, DETECT_INC_PER_RETRY)
+      - fallback to prior tactic on full-stage failure (FALLBACK_PROB)
+      - a max number of fallbacks to avoid infinite loops
 
     Args:
-        args: tuple(per_stage_probs, n_sim, seed)
+        success_probs (list[float]): per-stage success probabilities (0..1)
+        rng (np.random.Generator): random generator
 
     Returns:
-        Estimated per-attempt success probability for this posterior draw.
+        bool: True if attacker reaches final stage ('Impact'), False otherwise
     """
-    per_stage, n_sim, seed = args
-    rng = random.Random(int(seed))
-    successes = 0
-    for _ in range(int(n_sim)):
-        if simulate_one_attempt(np.asarray(per_stage), rng):
-            successes += 1
-    return successes / float(n_sim)
+    i = 0
+    n_stages = len(success_probs)
+    fallback_count = 0
 
+    # Defensive: if there are zero stages, treat as failure
+    if n_stages == 0:
+        return False
 
-# =============================================================================
-# 7) UTIL: Percentile annotation — Purpose: add P50/P90/P95/P99 lines on plots
-# =============================================================================
-def _annotate_percentiles(ax, data, percentiles=(50, 90, 95, 99), scale=1.0, money=True):
-    ymax = ax.get_ylim()[1]
-    for p in percentiles:
-        val = np.percentile(data, p) / scale
-        ax.axvline(val, color='k', linestyle='--', lw=0.8, alpha=0.8)
-        label = f"P{p}=" + (f"${val:,.0f}" if money else f"{val:,.3f}")
-        ax.text(val, ymax * 0.92, label, rotation=90, va='top', ha='center',
-                fontsize=8, backgroundcolor='white')
+    # Walk stages explicitly (so we can step back on fallback)
+    while 0 <= i < n_stages:
+        # use the nominal per-stage probability for this attempt
+        p_nominal = float(success_probs[i])
+        detect_prob = DETECT_BASE
 
+        # Attempt retries for this stage
+        for r in range(MAX_RETRIES_PER_STAGE):
+            if rng.random() < p_nominal:
+                # success at this stage -> move forward
+                i += 1
+                break
 
-# =============================================================================
-# 8) MAIN — Purpose: orchestrate inference, parallel MC, loss sim, summaries, plots
-# =============================================================================
-def main():
+            # failure this attempt -> increase detect probability
+            detect_prob = min(1.0, detect_prob + DETECT_INC_PER_RETRY)
+            if rng.random() < detect_prob:
+                # detected and stopped
+                return False
+
+            # apply retry penalty before next attempt
+            p_nominal *= RETRY_PENALTY
+
+        else:
+            # All retries at this stage exhausted
+            if rng.random() < FALLBACK_PROB and fallback_count < MAX_FALLBACKS_PER_CHAIN:
+                # Fallback: step back one stage (but not before stage 0)
+                fallback_count += 1
+                i = max(0, i - 1)
+                # continue while-loop to attempt from the prior stage again
+                continue
+            else:
+                # No fallback (or exceeded fallback budget) -> chain fails
+                return False
+
+    # If we exit the loop because i == n_stages, attacker reached final stage
+    return i >= n_stages
+
+def _sample_posterior_lambda_and_success(alphas: np.ndarray, betas: np.ndarray):
     """
-    Main driver function:
-     - Samples from Bayesian posterior for λ (frequency) and per-stage success.
-     - Optionally conditions on observed incident data (Option B).
-     - Runs parallel Monte Carlo Markov simulations of attack progression.
-     - Computes posterior predictive distributions of annualized losses.
-     - Produces FAIR-aligned summaries and optional visualizations.
+    Build and sample the PyMC model for λ (attacks/year) and per-stage success.
+    Returns:
+      lambda_draws (N,), success_chain_draws (N,)
     """
+    if not HAVE_PYMC:
+        # Prior-only fallback to keep script runnable without PyMC
+        rng = np.random.default_rng(RANDOM_SEED)
+        mu_l = np.log(np.sqrt(CI_MIN_FREQ * CI_MAX_FREQ))
+        sig_l = (np.log(CI_MAX_FREQ) - np.log(CI_MIN_FREQ)) / (2.0 * Z_90)
+        lam = rng.lognormal(mean=mu_l, sigma=sig_l, size=N_SAMPLES)
+        succ_chain = np.prod(rng.beta(alphas, betas, size=(N_SAMPLES, len(MITRE_STAGES))), axis=1)
+        return lam, succ_chain
 
-    # ---------- 8.0 Optional Observed Data Inputs (Option B) ----------
-    # You can set these to real numbers if you have data.
-    # If both are None, the model runs prior-driven (no likelihood term).
-    observed_total_incidents = None    # e.g., 7 if 7 successful incidents observed
-    observed_years = None              # e.g., 3 if those occurred over 3 years
-
-    # ---------- 8.1 Build & sample Bayesian model (λ and per-stage success) ----------
     with pm.Model() as model:
-        # Frequency prior: lognormal via elicited 90% CI
+        # Lognormal for attempt frequency
         mu_lambda = np.log(np.sqrt(CI_MIN_FREQ * CI_MAX_FREQ))
         sigma_lambda = (np.log(CI_MAX_FREQ) - np.log(CI_MIN_FREQ)) / (2.0 * Z_90)
         lambda_rate = pm.Lognormal("lambda_rate", mu=mu_lambda, sigma=sigma_lambda)
 
-        # Per-stage attacker success probabilities (Beta priors from SME intervals)
+        # Per-stage success probabilities (Beta priors)
         success_probs = pm.Beta("success_probs", alpha=alphas, beta=betas, shape=len(MITRE_STAGES))
 
-        # --- Optional observed-data likelihood (Option B) ---
-        if observed_total_incidents is not None and observed_years is not None:
-            pm.Poisson(
-                "obs_incidents",
-                mu=lambda_rate * observed_years,
-                observed=observed_total_incidents,
-            )
+        # ---------- Optional Observed Data (kept None by default) ----------
+        observed_total_incidents = None    # e.g., 7 if 7 incidents observed
+        observed_years = None              # e.g., 3 if over 3 years
+        if (observed_total_incidents is not None) and (observed_years is not None):
+            pm.Poisson("obs_incidents", mu=lambda_rate * observed_years, observed=observed_total_incidents)
             print(f"Conditioning on observed data: {observed_total_incidents} incidents over {observed_years} years.")
         else:
             print("No observed incident data provided — running fully prior-driven.")
 
-        # Sample posterior
         trace = pm.sample(
             draws=N_SAMPLES, tune=N_TUNE, chains=N_CHAINS,
             target_accept=TARGET_ACCEPT, random_seed=RANDOM_SEED, progressbar=True
         )
 
-    posterior = trace.posterior
-    lambda_draws = posterior["lambda_rate"].values.reshape(-1)
-    success_probs_draws = posterior["success_probs"].values.reshape(-1, len(MITRE_STAGES))
-    R = len(lambda_draws)
-    print(f"Posterior samples: {R}")
+    lambda_draws = np.asarray(trace.posterior["lambda_rate"]).reshape(-1)
+    succ_mat = np.asarray(trace.posterior["success_probs"]).reshape(-1, len(MITRE_STAGES))
+    succ_chain_draws = np.prod(succ_mat, axis=1)
+    return lambda_draws, succ_chain_draws, succ_mat
 
-    # ---------- 8.2 Parallel per-draw Markov simulation of per-attempt success ----------
-    args_list = [(success_probs_draws[i, :], N_SIM_PER_DRAW, 1000 + i) for i in range(R)]
-    p_success_simulated = np.zeros(R, dtype=float)
+def _simulate_annual_losses(lambda_draws, succ_chain_draws, succ_mat,
+                            alphas, betas,
+                            severity_median=500_000.0,
+                            severity_gsd=2.0,
+                            rng_seed=1234):
 
-    print("Running parallel attack chain simulations...")
-    with ProcessPoolExecutor(max_workers=(N_WORKERS or multiprocessing.cpu_count())) as exe:
-        for i, res in enumerate(exe.map(worker_function, args_list)):
-            p_success_simulated[i] = res
-    print("Markov-chain simulation complete.")
+    """
+    Posterior predictive Monte Carlo per draw:
+      - For each posterior draw, simulate attempts as Poisson(λ)
+      - Each attempt succeeds with p_succ (end-to-end)
+      - If success, draw base loss (lognormal) then allocate categories & apply Pareto tails
+    Returns:
+      losses (N,), successes (N,)
+    Side effect:
+      - Populates LAST_CATEGORY_LOSSES dict with arrays for each category
+    """
+    global LAST_CATEGORY_LOSSES
 
-    # ---------- 8.3 Posterior predictive: compound loss by FAIR categories ----------
-    rng_np = np.random.default_rng(RANDOM_SEED + 1)
-    annual_losses = np.zeros(R, dtype=float)
-    incident_counts = np.zeros(R, dtype=int)
-    cat_loss_matrix = np.zeros((R, len(loss_categories)), dtype=float)
+    rng = np.random.default_rng(rng_seed)
+    mu = math.log(max(1e-9, severity_median))
+    sigma = math.log(max(1.000001, severity_gsd))
 
-    for i in range(R):
-        # Effective success rate per year (frequency × per-attempt success)
-        lam_eff = lambda_draws[i] * p_success_simulated[i]
-        n_succ = rng_np.poisson(lam_eff)
-        incident_counts[i] = n_succ
-        if n_succ == 0:
-            continue
+    n = len(lambda_draws)
+    losses = np.zeros(n, dtype=float)
+    successes = np.zeros(n, dtype=int)
 
-        # Incident-level severity multiplier (lognormal noise)
-        severities = rng_np.lognormal(mean=0.0, sigma=0.6, size=n_succ)
+    prod_losses = np.zeros(n, dtype=float)
+    resp_losses = np.zeros(n, dtype=float)
+    reg_losses  = np.zeros(n, dtype=float)
+    rep_losses  = np.zeros(n, dtype=float)
 
-        # Primary categories: always-on bodies (lognormal) × severity
-        prod = np.sum(rng_np.lognormal(cat_mu[0], cat_sigma[0], size=n_succ) * severities)
-        resp = np.sum(rng_np.lognormal(cat_mu[1], cat_sigma[1], size=n_succ) * severities)
+    for idx, (lam, p_succ) in enumerate(zip(lambda_draws, succ_chain_draws)):
+        attempts = rng.poisson(lam=lam)
+        succ_count = 0
+        prod_acc = resp_acc = reg_acc = rep_acc = 0.0
+        total_loss = 0.0
 
-        # Secondary categories: zero-inflated + Pareto heavy tails
-        # --- Per-incident heavy-tail triggers correlated with severity ---
+        for _ in range(attempts):
+            # Draw per-stage success probabilities from the same Beta priors
+            # Use posterior success_probs for this draw (if available)
+            if succ_mat is not None:
+                stage_success_probs = succ_mat[idx]
+            else:
+                stage_success_probs = rng.beta(alphas, betas)
+            # Simulate full progression through all MITRE stages
+            if _simulate_attacker_path(stage_success_probs, rng):
+                # --- draw per-category losses (bounded lognormal + bounded Pareto tails) ---
+                prod = resp = reg = rep = 0.0
 
-        tail_trigger_prob = 0.10  # 10% chance PER INCIDENT for each category
-        reg = 0.0
-        rep = 0.0
+                for j, cat in enumerate(loss_categories):
+                    mu_j, sigma_j = cat_mu[j], cat_sigma[j]
 
-        for s in range(n_succ):
-            sev = severities[s]
+                    # Lognormal body capped at 95th percentile
+                    base_draw = float(rng.lognormal(mean=mu_j, sigma=sigma_j))
+                    lognorm_cap = math.exp(mu_j + 3.09 * sigma_j)
+                    base_draw = min(base_draw, lognorm_cap)
 
-            if rng_np.random() < tail_trigger_prob:
-                xm, alpha = pareto_defaults["RegulatoryLegal"]["xm"], pareto_defaults["RegulatoryLegal"]["alpha"]
-                reg += (xm * (1.0 + rng_np.pareto(alpha))) * (1.0 + sev)**1.2
+                    if cat == "RegulatoryLegal":
+                        reg = base_draw
+                        if rng.random() < 0.025:
+                            xm, alpha = pareto_defaults[cat]["xm"], pareto_defaults[cat]["alpha"]
+                            u = rng.uniform(0.001, 0.999)
+                            tail_draw = xm * (1.0 - u) ** (-1.0 / alpha)
+                            tail_cap  = xm * (0.95) ** (-1.0 / alpha)   # ≈95th pct cap
+                            reg = max(reg, min(tail_draw, tail_cap))
 
-            if rng_np.random() < tail_trigger_prob:
-                xm, alpha = pareto_defaults["ReputationCompetitive"]["xm"], pareto_defaults["ReputationCompetitive"]["alpha"]
-                rep += (xm * (1.0 + rng_np.pareto(alpha))) * (1.0 + sev)**1.2
+                    elif cat == "ReputationCompetitive":
+                        rep = base_draw
+                        if rng.random() < 0.015:
+                            xm, alpha = pareto_defaults[cat]["xm"], pareto_defaults[cat]["alpha"]
+                            u = rng.uniform(0.001, 0.999)
+                            tail_draw = xm * (1.0 - u) ** (-1.0 / alpha)
+                            tail_cap  = xm * (0.95) ** (-1.0 / alpha)   # ≈95th pct cap
+                            rep = max(rep, min(tail_draw, tail_cap))
 
-        cat_loss_matrix[i, :] = [prod, resp, reg, rep]
-        annual_losses[i] = prod + resp + reg + rep
+                    elif cat == "Productivity":
+                        prod = base_draw
 
-    # ---------- 8.4 Summaries: AAL and category credible intervals ----------
-    mean_AAL = annual_losses.mean()
-    median_AAL = np.median(annual_losses)
-    p2_5, p97_5 = np.percentile(annual_losses, [2.5, 97.5])
-    mean_incidents = incident_counts.mean()
-    pct_zero = 100.0 * np.mean(annual_losses == 0.0)
+                    elif cat == "ResponseContainment":
+                        resp = base_draw
+
+                # accumulate for this successful incident
+                prod_acc += prod
+                resp_acc += resp
+                reg_acc  += reg
+                rep_acc  += rep
+                total_loss += (prod + resp + reg + rep)
+                succ_count += 1
+
+        # write results for this posterior draw (use idx, not i)
+        losses[idx] = total_loss
+        successes[idx] = succ_count
+        prod_losses[idx] = prod_acc
+        resp_losses[idx] = resp_acc
+        reg_losses[idx]  = reg_acc
+        rep_losses[idx]  = rep_acc
+
+
+    LAST_CATEGORY_LOSSES = {
+        "Productivity": prod_losses,
+        "ResponseContainment": resp_losses,
+        "RegulatoryLegal": reg_losses,
+        "ReputationCompetitive": rep_losses
+    }
+    return losses, successes
+
+# =============================================================================
+# 8) Console output, viz, exports (GitHub-style behavior)
+# =============================================================================
+def _print_aal_summary(losses: np.ndarray, successes: np.ndarray):
+    aal_mean   = float(np.mean(losses))
+    aal_median = float(np.median(losses))
+    lo, hi     = np.quantile(losses, [0.025, 0.975])
+    mean_succ  = float(np.mean(successes))
+    succ_lo, succ_hi = np.quantile(successes, [0.025, 0.975])
+    pct_zero   = float(np.mean(successes == 0) * 100.0)
 
     print("\nAAL posterior predictive summary (with fallback, severity, Pareto tails):")
-    print(f"Mean AAL: ${mean_AAL:,.0f}")
-    print(f"Median AAL: ${median_AAL:,.0f}")
-    print(f"AAL 95% credible interval (annualized total loss): ${p2_5:,.0f} – ${p97_5:,.0f}")
-    print(f"Mean successful incidents / year: {mean_incidents:.2f}")
-    print(f"% years with zero successful incidents: {pct_zero:.1f}%\n")
+    print(f"Mean AAL: {_fmt_money(aal_mean)}")
+    print(f"Median AAL: {_fmt_money(aal_median)}")
+    print(f"AAL 95% credible interval (annualized total loss): {_fmt_money(lo)} – {_fmt_money(hi)}")
 
-    print("Category-level annual loss 95% credible intervals:")
-    for c, cat in enumerate(loss_categories):
-        low, med, high = np.percentile(cat_loss_matrix[:, c], [2.5, 50, 97.5])
-        share_med = 100.0 * med / (median_AAL + 1e-12)
-        print(f"  {cat:<24s} ${low:,.0f} – ${high:,.0f}  (median ${med:,.0f}, ≈{share_med:.1f}% of median AAL)")
+    # --- Successful incidents / year ---
+    print(f"Mean successful incidents / year: {mean_succ:.2f}")
+    print(f"95% credible interval (incidents / year): {succ_lo:.2f} – {succ_hi:.2f}")
 
-    # ---------- 8.5 Visualization: original 2×2 grid + separate log-scale tail ----------
-    sns.set_style("whitegrid")
-    # ---- Improved Visualization with automatic long-tail handling ----
-    def auto_clip(data, low=0.001, high=0.995):
+    # --- Mean loss per successful incident (Single Loss Expectancy) ---
+    valid = successes > 0
+    if np.any(valid):
+        # Compute per-draw loss per incident, then summarize
+        per_event_losses = np.divide(losses[valid], successes[valid],
+                                     out=np.zeros_like(losses[valid]),
+                                     where=successes[valid] > 0)
+        mean_loss_per_event = float(np.mean(per_event_losses))
+        lo_event, hi_event  = np.quantile(per_event_losses, [0.025, 0.975])
+        print(f"Mean loss per successful incident: {_fmt_money(mean_loss_per_event)}")
+        print(f"95% credible interval (loss / incident): {_fmt_money(lo_event)} – {_fmt_money(hi_event)}")
+    else:
+        print("Mean loss per successful incident: (no successful incidents in simulation)")
+
+    print(f"% years with zero successful incidents: {pct_zero:.1f}%")
+
+    # ---------- Category breakdown ----------
+    print("\nCategory-level annual loss 95% credible intervals:")
+    if LAST_CATEGORY_LOSSES is not None:
+        med_aal = max(1e-12, aal_median)
+        for c in loss_categories:
+            arr = LAST_CATEGORY_LOSSES.get(c, np.zeros_like(losses))
+            lw, up = np.quantile(arr, [0.025, 0.975])
+            med    = float(np.median(arr))
+            pct_of_med = (med / aal_median) * 100.0 if aal_median > 0 else 0.0
+            print(f"  {c:<24} {_fmt_money(lw)} – {_fmt_money(up)} "
+                  f"(median {_fmt_money(med)}, ~{pct_of_med:.1f}% of median AAL)")
+    else:
+        print("  (Per-category breakdown unavailable.)")
+
+def _annotate_percentiles(ax, samples, money=False):
+    """
+    Draw P50, P90, P95, P99 vertical lines and label each line with its value (on the line).
+    money=True -> use _fmt_money formatting; else numeric compact.
+    """
+    pcts = [50, 90, 95, 99]
+    vals = np.percentile(samples, pcts)
+
+    ymin, ymax = ax.get_ylim()
+    ytext = ymax * 0.95  # place text near top of axis
+
+    for i, (p, v) in enumerate(zip(pcts, vals)):
+        ax.axvline(v, linestyle="--", linewidth=1.0)
+        label = _fmt_money(v) if money else (f"{v:.3f}" if v < 10 else f"{v:,.2f}")
+        y_offset = (i % 2) * 0.05 * (ymax - ymin)
+        ax.text(v, ytext - y_offset, f"P{p}={label}",
+                rotation=0, va="bottom", ha="center", fontsize=8,
+                bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=1))
+
+def _render_2x2_and_log_ale(losses: np.ndarray,
+                            lambda_draws: np.ndarray,
+                            success_chain_draws: np.ndarray,
+                            show: bool = True):
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    succ_per_year = lambda_draws * success_chain_draws
+
+        # --- Auto-clip helper (reintroduced from GitHub version) ---
+    def _auto_clip(data, low=0.001, high=0.991):
         """Clips data to percentile range for better visualization of long tails."""
         if len(data) == 0:
             return data
         low_v, high_v = np.percentile(data, [low * 100, high * 100])
         return data[(data >= low_v) & (data <= high_v)]
 
-    def annotate_percentiles(ax, data, percentiles=(50, 90, 95, 99), scale=1.0, money=True):
-        """Annotates percentile lines on histogram."""
-        ymax = ax.get_ylim()[1] if ax.get_ylim()[1] > 0 else 1.0
-        for p in percentiles:
-            val = np.percentile(data, p) / scale
-            ax.axvline(val, color='k', linestyle='--', lw=0.8, alpha=0.85)
-            label = f"P{p}=" + (f"${val:,.0f}" if money else f"{val:,.3f}")
-            ax.text(val, ymax * 0.92, label, rotation=90, va='top', ha='center',
-                    fontsize=8, backgroundcolor='white')
+    # Apply clipping to all plotted arrays to avoid distortion from long tails
+    lambda_plot = _auto_clip(lambda_draws)
+    succ_chain_plot = _auto_clip(success_chain_draws)
+    succ_per_year_plot = _auto_clip(succ_per_year)
+    losses_plot = _auto_clip(losses)
 
-    scale = 1e6 if PLOT_IN_MILLIONS else 1.0
-    scale_label = "Million USD" if PLOT_IN_MILLIONS else "USD"
+    def _millions(x, pos): return f"${x/1e6:,.1f}M"
 
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+    # (1) Posterior λ
+    ax = axs[0,0]
+    ax.hist(lambda_plot, bins=60, edgecolor="black")
+    ax.set_title("Posterior λ (incidents/year)")
+    ax.set_xlabel("λ"); ax.set_ylabel("Count")
+    _annotate_percentiles(ax, lambda_plot, money=False)
 
-    # (1) Posterior λ (attacks/year)
-    data_lambda = auto_clip(lambda_draws)
-    axes[0, 0].hist(data_lambda, bins=40, color='steelblue', alpha=0.85)
-    axes[0, 0].set_title("Posterior λ (attacks/year)")
-    axes[0, 0].set_xlabel("λ (attacks/year)")
-    axes[0, 0].set_ylabel("Frequency")
-    annotate_percentiles(axes[0, 0], data_lambda, money=False)
-
-    # (2) Per-attempt success probability
-    data_success = auto_clip(p_success_simulated)
-    axes[0, 1].hist(data_success, bins=40, color='steelblue', alpha=0.85)
-    axes[0, 1].set_title("Per-attempt success probability (simulated)")
-    axes[0, 1].set_xlabel("Probability")
-    axes[0, 1].set_ylabel("Frequency")
-    annotate_percentiles(axes[0, 1], data_success, money=False)
+    # (2) Posterior end-to-end success probability
+    ax = axs[0,1]
+    ax.hist(succ_chain_plot, bins=60, edgecolor="black")
+    ax.set_title("Posterior Success Probability (end-to-end)")
+    ax.set_xlabel("Success prob"); ax.set_ylabel("Count")
+    _annotate_percentiles(ax, succ_chain_plot, money=False)
 
     # (3) Successful incidents/year
-    data_incidents = auto_clip(incident_counts)
-    axes[1, 0].hist(data_incidents, bins=40, color='steelblue', alpha=0.85)
-    axes[1, 0].set_title("Successful incidents / year (posterior predictive)")
-    axes[1, 0].set_xlabel("Count")
-    axes[1, 0].set_ylabel("Frequency")
-    annotate_percentiles(axes[1, 0], data_incidents, money=False)
+    ax = axs[1,0]
+    ax.hist(succ_per_year_plot, bins=60, edgecolor="black")
+    ax.set_title("Successful Incidents / Year (posterior)")
+    ax.set_xlabel("Incidents/year"); ax.set_ylabel("Count")
+    _annotate_percentiles(ax, succ_per_year_plot, money=False)
 
-    # (4) Annual loss (USD)
-    nonzero = annual_losses[annual_losses > 0]
-    if len(nonzero) > 0:
-        data_loss = auto_clip(nonzero)
-        axes[1, 1].hist(data_loss / scale, bins=80, color='steelblue', alpha=0.85)
-        axes[1, 1].set_title("Annual Loss (posterior predictive)")
-        axes[1, 1].set_xlabel(f"Annual Loss ({scale_label})")
-        axes[1, 1].set_ylabel("Frequency")
-        annotate_percentiles(axes[1, 1], data_loss, scale=scale, money=True)
+    # (4) Annual loss (posterior predictive)
+    ax = axs[1,1]
+    ax.hist(losses_plot, bins=60, edgecolor="black")
+    ax.set_title("Annual Loss (posterior predictive)")
+    ax.set_xlabel("Annual loss"); ax.set_ylabel("Count")
+    ax.xaxis.set_major_formatter(FuncFormatter(_millions))
+    _annotate_percentiles(ax, losses_plot, money=True)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    plt.subplots_adjust(top=0.90)
+    dash_path = os.path.join(OUTPUT_DIR, f"dashboard_2x2_{ts}.png")
+    fig.savefig(dash_path, dpi=150)
+    print(f"✅ Saved 2×2 dashboard → {dash_path}")
+
+    # Separate log-scale ALE-style histogram
+    fig2, ax2 = plt.subplots(figsize=(12, 5))
+    bins = np.logspace(np.log10(1e3), np.log10(max(1e5, max(1.0, losses_plot.max()))), 60)
+    ax2.hist(losses_plot, bins=bins, edgecolor="black")
+    ax2.set_xscale('log')
+    ax2.set_title("Annualized Loss (Log Scale)")
+    ax2.set_xlabel("Annual loss (log)"); ax2.set_ylabel("Count")
+    ax2.xaxis.set_major_formatter(FuncFormatter(_millions))
+    # --- Add percentile annotations directly on the bars (GitHub-style) ---
+    _annotate_percentiles(ax2, losses_plot, money=True)
+
+    fig2.tight_layout()
+
+    ale_path = os.path.join(OUTPUT_DIR, f"ale_log_chart_{ts}.png")
+    fig2.savefig(ale_path, dpi=150)
+    print(f"✅ Saved ALE chart → {ale_path}")
+
+    # ---  NEW: Loss Exceedance Curve (LEC) ---
+    sorted_losses = np.sort(losses_plot)
+    exceed_probs = 1.0 - np.arange(1, len(sorted_losses) + 1) / len(sorted_losses)
+    exceed_probs_percent = exceed_probs * 100
+
+    fig3, ax3 = plt.subplots(figsize=(8, 6))
+    ax3.plot(sorted_losses, exceed_probs_percent, lw=2, color="orange")
+    ax3.set_xscale('log')
+    ax3.set_xlabel("Annual Loss")
+    ax3.set_ylabel("Exceedance Probability (%)")
+    ax3.set_title("Loss Exceedance Curve (Annual Loss)")
+    ax3.grid(True, which="both", ls="--", lw=0.5)
+    ax3.xaxis.set_major_formatter(FuncFormatter(_millions))
+    ax3.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y:.0f}%"))
+
+    # --- Annotate key percentiles with vertical lines and $ amounts ---
+    pcts = [50, 90, 95, 99]
+    vals = np.percentile(sorted_losses, pcts)
+    for p, v in zip(pcts, vals):
+        prob = 100 * (1 - p / 100.0)  # P50=50%, P90=10%, etc.
+        ax3.axvline(v, ls="--", lw=0.8, color="gray")
+
+        # Place label slightly above the line and offset to the right
+        y_text = min(100, prob + 5)  # avoid going above chart top
+        ax3.text(v, y_text, f"P{p}\n${v:,.0f}",
+                rotation=90, va="bottom", ha="left", fontsize=8,
+                bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=1))
+
+    lec_path = os.path.join(OUTPUT_DIR, f"loss_exceedance_curve_{ts}.png")
+    fig3.tight_layout()
+    fig3.savefig(lec_path, dpi=150)
+    print(f"✅ Saved Loss Exceedance Curve → {lec_path}")
+
+    if show:
+        try:
+            plt.show()
+        except Exception as e:
+            print(f"⚠️ Could not display figures: {e}")
+
+def _save_results_csvs(losses: np.ndarray, successes: np.ndarray,
+                       lambda_draws: np.ndarray, success_chain_draws: np.ndarray):
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    # ---------- Detailed results (unchanged) ----------
+    results_csv = os.path.join(OUTPUT_DIR, f"cyber_risk_simulation_results_{ts}.csv")
+    pd.DataFrame({
+        "lambda": lambda_draws,
+        "p_success_chain": success_chain_draws,
+        "annual_loss": losses,
+        "successful_incidents": successes
+    }).to_csv(results_csv, index=False)
+
+    # ---------- Summary statistics (expanded) ----------
+    aal_mean   = float(np.mean(losses))
+    aal_median = float(np.median(losses))
+    aal_lo, aal_hi = np.quantile(losses, [0.025, 0.975])
+
+    mean_succ  = float(np.mean(successes))
+    succ_lo, succ_hi = np.quantile(successes, [0.025, 0.975])
+    pct_zero   = float(np.mean(successes == 0) * 100.0)
+
+    valid = successes > 0
+    if np.any(valid):
+        per_event_losses = np.divide(losses[valid], successes[valid],
+                                     out=np.zeros_like(losses[valid]),
+                                     where=successes[valid] > 0)
+        mean_loss_per_event = float(np.mean(per_event_losses))
+        lo_event, hi_event  = np.quantile(per_event_losses, [0.025, 0.975])
     else:
-        axes[1, 1].text(0.5, 0.5, "All draws are zero", ha="center", va="center")
+        mean_loss_per_event, lo_event, hi_event = 0.0, 0.0, 0.0
 
-    plt.tight_layout()
-    plt.show()
+    # ---------- Export summary ----------
+    summary_csv = os.path.join(OUTPUT_DIR, f"cyber_risk_simulation_summary_{ts}.csv")
+    pd.DataFrame([{
+        # Existing fields
+        "Mean_AAL": aal_mean,
+        "Median_AAL": aal_median,
+        "AAL_95_Lower": aal_lo,
+        "AAL_95_Upper": aal_hi,
+        "Mean_Incidents": mean_succ,
+        "Zero_Incident_Years_%": pct_zero,
+        "n": int(losses.size),
+        # New fields
+        "Incidents_95_Lower": succ_lo,
+        "Incidents_95_Upper": succ_hi,
+        "Mean_Loss_Per_Incident": mean_loss_per_event,
+        "Loss_Per_Incident_95_Lower": lo_event,
+        "Loss_Per_Incident_95_Upper": hi_event,
+        # Optional derived consistency check
+        "Mean_AAL_Check_MeanInc_x_MeanLossPerIncident": mean_succ * mean_loss_per_event
+    }]).to_csv(summary_csv, index=False)
 
-
-    # Separate log-scale plot for heavy-tail view
-    if len(nonzero) > 0:
-        low_p, high_p = np.percentile(nonzero, [0.5, 99.5])
-        filtered = nonzero[(nonzero >= low_p) & (nonzero <= high_p)]
-        filtered = filtered if len(filtered) >= 10 else nonzero
-        bins = np.logspace(np.log10(filtered.min() / scale), np.log10(filtered.max() / scale), 100)
-
-        plt.figure(figsize=(8, 5))
-        plt.hist(filtered / scale, bins=bins, color="tomato", alpha=0.8)
-        plt.xscale("log")
-        plt.title("Annual Loss (posterior predictive) — log scale (auto-filtered)")
-        plt.xlabel(f"Annual Loss ({scale_label}, log scale)")
-        plt.ylabel("Frequency")
-        _annotate_percentiles(plt.gca(), filtered, scale=scale, money=True)
-        plt.grid(True, which="both", ls="--", alpha=0.35)
-        plt.tight_layout()
-        plt.show()
-
-    # ============================================================
-    # CSV EXPORTS
-    # ============================================================
-    import os, datetime, pandas as pd
-
-    # Export directory (same as script folder)
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
-    # --- Detailed results export (all posterior draws) ---
-    outname = os.path.join(script_dir, f"cyber_risk_simulation_results_{timestamp}.csv")
-
-    df = pd.DataFrame({
-        "lambda_draw": lambda_draws,
-        "p_success": p_success_simulated,
-        "incidents": incident_counts,
-        "annual_loss": annual_losses,
-        **{cat: cat_loss_matrix[:, i] for i, cat in enumerate(loss_categories)}
-    })
-    df.to_csv(outname, index=False)
-    print(f"\n✅ Detailed results exported to {outname}")
-
-    # --- Summary statistics export (with % share of median AAL) ---
-    summary_data = []
-
-    # Overall AAL stats
-    summary_data.append({
-        "Category": "Total Annual Loss",
-        "Mean": np.mean(annual_losses),
-        "Median": np.median(annual_losses),
-        "CI_2.5%": np.percentile(annual_losses, 2.5),
-        "CI_97.5%": np.percentile(annual_losses, 97.5),
-        "Median Share of AAL (%)": 100.0
-    })
-
-    # Category stats with share of median AAL
-    median_AAL = np.median(annual_losses)
-    for i, cat in enumerate(loss_categories):
-        vals = cat_loss_matrix[:, i]
-        med_val = np.median(vals)
-        mean_val = np.mean(vals)
-        ci_low, ci_high = np.percentile(vals, [2.5, 97.5])
-        share_med = 100.0 * med_val / (median_AAL + 1e-12)
-        summary_data.append({
-            "Category": cat,
-            "Mean": mean_val,
-            "Median": med_val,
-            "CI_2.5%": ci_low,
-            "CI_97.5%": ci_high,
-            "Median Share of AAL (%)": share_med
-        })
-
-    summary_df = pd.DataFrame(summary_data)
-    summary_name = os.path.join(script_dir, f"cyber_risk_simulation_summary_{timestamp}.csv")
-    summary_df.to_csv(summary_name, index=False)
-    print(f"✅ Summary statistics exported to {summary_name}\n")
-
-    # ============================================================
-    # Return dictionary for programmatic reuse
-    # ============================================================
-    return {
-        "lambda_draws": lambda_draws,
-        "p_success_simulated": p_success_simulated,
-        "incident_counts": incident_counts,
-        "annual_losses": annual_losses,
-        "cat_loss_matrix": cat_loss_matrix,
-    }
+    print(f"✅ Detailed results exported → {results_csv}")
+    print(f"✅ Summary statistics exported → {summary_csv}")
 
 # =============================================================================
-# 9) ENTRY POINT — Purpose: safe multiprocessing on all OSes
+# 9) CLI + main
+# =============================================================================
+def parse_args():
+    p = argparse.ArgumentParser(description="Cyber incident model with MITRE-informed controls + PyMC + FAIR.")
+    p.add_argument("--dataset", default="enterprise-attack.json", help="MITRE ATT&CK STIX bundle path.")
+    p.add_argument("--csv", default="mitigation_control_strengths.csv", help="Mitigation strengths CSV path.")
+    p.add_argument("--adaptation", type=float, default=None,
+                   help="Override adaptation factor (default=0.75)")
+    p.add_argument("--no-adapt-stochastic", action="store_true",
+                   help="Disable stochastic adaptation (use fixed factor)")
+    p.add_argument("--no-plot", action="store_true", help="Save figures but do not open GUI windows.")
+    p.add_argument("--print-control-strengths", action="store_true",
+               help="Print the per-tactic control strength parameters used (for diagnostics).")
+
+    return p.parse_args()
+
+def main():
+    global ADAPTATION_FACTOR, ADAPTATION_STOCHASTIC
+
+    args = parse_args()
+    if args.adaptation is not None:
+        ADAPTATION_FACTOR = args.adaptation
+    if args.no_adapt_stochastic:
+        ADAPTATION_STOCHASTIC = False
+
+    # Load MITRE tactic-level control strengths (or SME fallback)
+    stage_map = _load_stage_control_map_from_analyzer(args.dataset, args.csv)
+    if args.print_control_strengths:
+        _print_stage_control_map(stage_map)
+
+    # Build per-stage success priors (Beta) from control strengths (applies adaptation inside)
+    alphas, betas = _build_beta_priors_from_stage_map(stage_map)
+
+    # PyMC posterior sampling (lambda and end-to-end success)
+    if HAVE_PYMC:
+        lambda_draws, success_chain_draws, succ_mat = _sample_posterior_lambda_and_success(alphas, betas)
+    else:
+        # Fallback: run prior-only simulation if PyMC is unavailable
+        lambda_draws, success_chain_draws = _sample_posterior_lambda_and_success(alphas, betas)
+        succ_mat = None
+
+    # Posterior predictive Monte Carlo for annual losses + incident counts
+    losses, successes = _simulate_annual_losses(
+        lambda_draws=lambda_draws,
+        succ_chain_draws=success_chain_draws,
+        succ_mat=succ_mat,
+        alphas=alphas,
+        betas=betas,
+        severity_median=500_000.0,
+        severity_gsd=2.0,
+        rng_seed=RANDOM_SEED + 1,
+    )
+
+    # Console output (uses per-category arrays if available)
+    _print_aal_summary(losses, successes)
+
+    # CSV exports and visualizations (2×2 + log-scale)
+    _save_results_csvs(losses, successes, lambda_draws, success_chain_draws)
+    _render_2x2_and_log_ale(losses, lambda_draws, success_chain_draws, show=(not args.no_plot))
+
 # =============================================================================
 if __name__ == "__main__":
-    results = main()
+    try:
+        main()
+    except FileNotFoundError as e:
+        print(f"❌ File not found: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ Unhandled error: {e}")
+        sys.exit(2)

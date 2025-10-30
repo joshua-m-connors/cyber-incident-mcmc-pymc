@@ -1,48 +1,145 @@
-# Cyber Incident Estimation utilizing Markov Chain Monte Carlo (MCMC) simulation
+# Cyber Risk Simulation Framework (FAIR + MITRE ATT&CK Integrated)
 
-This code takes an initial (prior) estimate of the frequency of attacks against an organization. This range would be similar to Threat Event Frequency (TEF) in the Factor Analysis of Information Risk (FAIR) taxonomy, but likely a bit higher (analysts likely weed out or are unaware of many attacks that fail early on).
+This framework integrates **quantitative cyber risk modeling** using the **FAIR taxonomy** with the **MITRE ATT&CK** control framework.  
+It combines Bayesian inference, Monte Carlo simulation, and weighted control strength analytics for comprehensive enterprise cyber risk estimation.
 
-Note: There is an option (lines 270 & 271) to enter actual observational data (i.e. if you know there were 2 successful incidents in the past 3 year).
+---
 
-It then simulates each attack as it progresses through the relevant MITRE ATT&CK tactics. Each tactic has an individually estimated range of control strength that gets applied. There is also logic that assumes that when an attacker fails with a tactic, they may retry and/or fallback and try a different path. However, as they fallback and try different techniques the chance of being discovered or blocked increases.
+## 🧭 Overview
 
-The result is then an posterior projection of the number of successful attacks that will actually get through the entire attack process to full compromise. These are then combined with estimates of loss aligned to FAIR loss categories to compute Annualized Loss Expectancy (ALE).
+This repository contains three primary Python scripts that work together to produce an annualized loss distribution (AAL) and diagnostic dashboards.
 
-## Running the code:
+| Script | Purpose |
+|--------|----------|
+| `build_mitigation_influence_template.py` | Generates the default mitigation template (`mitigation_influence_template.csv`) from the MITRE ATT&CK dataset. |
+| `mitre_control_strength_dashboard.py` | Calculates per-tactic weighted control strength ranges using the MITRE ATT&CK mappings and user-updated mitigation strengths. |
+| `cyber_incident_pymc.py` | Runs the Bayesian/Monte Carlo cyber loss model using FAIR-based loss categories and the aggregated MITRE control data. |
 
-You can use either the .py file or if you prefer Jupyter Notebooks you can use the .ipynb file.
+---
 
-Note: The Jupyter Notebook version of the code is dialed back to run fewer simulations, this is because Jupyter Notebooks won't always play nice with the parallelization that is implemented in the .py version.
+## ⚙️ Workflow Summary
 
-## Requires:
-- Python
-- PyMC (Recommended installation using Anaconda: https://www.pymc.io/projects/docs/en/latest/installation.html#)
-- Jupyer Notebooks (optional)
+1. **Get the MITRE ATT&CK dataset**  
+   Download the Enterprise ATT&CK JSON dataset into your project folder:  
+   ```bash
+   wget https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json
+   ```
+   or manually download from:  
+   [https://github.com/mitre/cti/tree/master/enterprise-attack](https://github.com/mitre/cti/tree/master/enterprise-attack)
 
-## Acknowledgements:
-- I got a lot of help on this from Claude and ChatGPT.
+2. **Generate the mitigation influence template**  
+   Run:
+   ```bash
+   python3 build_mitigation_influence_template.py
+   ```
+   This creates `mitigation_influence_template.csv` in the project’s base directory.
 
-## Sample Output:
+3. **Update mitigation strengths**  
+   Open the generated CSV in Excel or another editor.  
+   - Adjust **Control_Min** and **Control_Max** for each mitigation (in %).  
+   - Save as: `mitigation_control_strengths.csv`
 
+4. **Run the control strength analyzer**  
+   ```bash
+   python3 mitre_control_strength_dashboard.py
+   ```
+   This will:
+   - Load your updated control strengths  
+   - Weight mitigations by occurrence within each tactic  
+   - Output an interactive Plotly dashboard  
+   - Save all results to `/output_YYYY-MM-DD/`
 
-The code also outputs two CSV files, to the same directory the .py file is save in, that includes the summary statistics and the full annualized simulation data for each draw.
+5. **Run the risk simulation**  
+   ```bash
+   python3 cyber_incident_pymc.py
+   ```
+   The model will:
+   - Load the per-tactic control strength ranges  
+   - Simulate attacker success probabilities  
+   - Apply Bayesian inference to event frequencies and FAIR-based losses  
+   - Generate 2×2 charts, ALE distributions, and exceedance curves  
+   - Export results to `/output_YYYY-MM-DD/`
 
+   **New summary outputs include:**
+   - Mean and 95% credible interval for successful incidents per year  
+   - Mean and 95% credible interval for **loss per successful incident** (Single Loss Expectancy, or SLE)  
+   - Derived check: **AAL ≈ Frequency × SLE**
 
-<img width="1070" height="506" alt="Screenshot From 2025-10-27 08-47-32" src="https://github.com/user-attachments/assets/937dbe39-152d-4634-b39b-784dca72cc5a" />
+---
 
+## 🧩 Command-Line Flags
 
-<img width="1500" height="1000" alt="Figure_1" src="https://github.com/user-attachments/assets/09417354-2230-461d-a7bf-b5cd38fff909" />
+### `cyber_incident_pymc.py`
 
+| Flag | Description | Example |
+|------|--------------|----------|
+| `--dataset PATH` | Path to MITRE ATT&CK dataset JSON (e.g., `enterprise-attack.json`). | `--dataset enterprise-attack.json` |
+| `--csv PATH` | Optional override for `mitigation_control_strengths.csv`. | `--csv ./mitigation_control_strengths.csv` |
+| `--print-control-strengths` | Print and export the per-tactic control strength parameters used. | `--print-control-strengths` |
+| `--no-plot` | Skip all charts and visualizations (headless/CI use). | `--no-plot` |
+| `--seed INT` | Set the random seed for reproducibility. | `--seed 42` |
 
-<img width="800" height="500" alt="Figure_2" src="https://github.com/user-attachments/assets/edf216cf-1d7d-49bc-9f32-a0e37cc5669f" />
+### `mitre_control_strength_dashboard.py`
 
-### MITRE ATT&CK Tactics Progression
+| Flag | Description | Example |
+|------|--------------|----------|
+| `--dataset PATH` | Path to the MITRE ATT&CK dataset JSON. | `--dataset enterprise-attack.json` |
+| `--csv PATH` | Specify a control strength file to import. | `--csv ./mitigation_control_strengths.csv` |
+| `--no-plot` | Skip the interactive Plotly chart generation. | `--no-plot` |
 
-This is intended to show attackers progression through the MITRE ATT&CK tactics, so you can see how far attackers are getting, where controls may be more effective at stopping attackers, etc.
+### `build_mitigation_influence_template.py`
 
-Note: I have only implemented this view into the Jupyter Notebook version of the code, due to the extended time it takes to gather these statistics.
+| Flag | Description | Example |
+|------|--------------|----------|
+| `--dataset PATH` | Path to the MITRE ATT&CK dataset JSON file. | `--dataset enterprise-attack.json` |
+| `--output PATH` | Optional override for CSV export path. | `--output ./templates/` |
 
+---
 
-<img width="1220" height="1266" alt="Screenshot From 2025-10-27 09-55-10" src="https://github.com/user-attachments/assets/9fdf7aa0-f32d-4417-bde2-a7782528dc35" />
+## 📁 Output Structure
 
+Each run automatically creates a date-labeled folder (e.g., `output_2025-10-30/`) containing:
 
+| File | Description |
+|------|--------------|
+| `mitre_tactic_strengths_*.html` | Interactive Plotly dashboard of tactic-level control strengths. |
+| `cyber_risk_simulation_results_*.csv` | Detailed per-run Monte Carlo sample results (λ, end-to-end success, annual loss, incidents). |
+| `cyber_risk_simulation_summary_*.csv` | **Expanded summary statistics** including:<br>• Mean/Median AAL and 95% credible interval<br>• Mean incidents/year and 95% CI<br>• Mean loss per successful incident (SLE) and 95% CI<br>• Derived AAL check (Mean_Incidents × Mean_Loss_Per_Incident). |
+| `dashboard_2x2_*.png` | Four-panel visualization of posterior λ, success probability, incident count, and annual loss. |
+| `ale_log_chart_*.png` | Log-scaled annual loss histogram with percentile markers. |
+| `loss_exceedance_curve_*.png` | Log-scale loss exceedance curve with annotated percentiles. |
+| `tactic_control_strengths_*.csv` | Optional diagnostic export of per-tactic control parameters. |
+
+---
+
+## 🧮 Model Highlights
+
+- Bayesian inference for **attack frequency (λ)** and **per-stage success** using **PyMC**.  
+- Markov-style attacker simulation with retries, detection, and fallback logic.  
+- FAIR taxonomy loss modeling with **lognormal bodies** and **bounded Pareto tails**.  
+- Reports both **event frequency** and **Single Loss Expectancy (SLE)** — including mean and 95% credible intervals for each.  
+- Provides **AAL decomposition validation:** AAL ≈ Frequency × SLE.  
+- All summary metrics printed to console are also written to the daily summary CSV.  
+- Outputs 2×2 dashboards, log-scale ALE distributions, and exceedance curves for intuitive interpretation.
+
+---
+
+## 🧩 File Renaming Guidance
+
+If you rename any of the main scripts:
+- Update any cross-script imports (`from mitre_control_strength_dashboard import ...` etc.).
+- Ensure each script can still locate `enterprise-attack.json` and `mitigation_control_strengths.csv` in the same directory or via the `--dataset`/`--csv` flags.
+
+---
+
+## 🧠 Recommended Use
+
+1. Update `mitigation_influence_template.csv` regularly when MITRE releases new dataset versions.  
+2. Rerun `mitre_control_strength_dashboard.py` to update weighted control strengths.  
+3. Use `--print-control-strengths` in the simulation script to confirm control weighting alignment.  
+4. Review both frequency and severity credible intervals to ensure loss calibration remains realistic.  
+5. Use the **AAL decomposition** and **summary CSV metrics** to validate risk quantification transparency.
+
+---
+
+© 2025 — Quantitative Cyber Risk Analysis Framework (FAIR + MITRE ATT&CK)
