@@ -141,9 +141,13 @@ MAX_FALLBACKS_PER_CHAIN = 3        # max fallbacks allowed in one attack chain
 PLOT_IN_MILLIONS = True
 
 # Attacker adaptation (how much of the nominal control block actually works)
-ADAPTATION_FACTOR = 0.95                 # deterministic fallback
+ADAPTATION_FACTOR = 0.99                 # deterministic fallback
 ADAPTATION_STOCHASTIC = True             # if True, sample once per run
-ADAPTATION_STOCHASTIC_RANGE = (0.60, 0.85)
+ADAPTATION_STOCHASTIC_RANGE = (0.85, 0.95)
+
+# Optional Observed Data (kept None by default)
+observed_total_incidents = None    # e.g., 7 if 7 incidents observed
+observed_years = None              # e.g., 3 if over 3 years
 
 # =============================================================================
 # 3) MITRE STAGES (fixed order for Enterprise)
@@ -411,9 +415,6 @@ def _sample_posterior_lambda_and_success(alphas: np.ndarray, betas: np.ndarray):
         # Per-stage success probabilities (Beta priors)
         success_probs = pm.Beta("success_probs", alpha=alphas, beta=betas, shape=len(MITRE_STAGES))
 
-        # ---------- Optional Observed Data (kept None by default) ----------
-        observed_total_incidents = None    # e.g., 7 if 7 incidents observed
-        observed_years = None              # e.g., 3 if over 3 years
         if (observed_total_incidents is not None) and (observed_years is not None):
             pm.Poisson("obs_incidents", mu=lambda_rate * observed_years, observed=observed_total_incidents)
             print(f"Conditioning on observed data: {observed_total_incidents} incidents over {observed_years} years.")
@@ -471,11 +472,34 @@ def _simulate_annual_losses(lambda_draws, succ_chain_draws, succ_mat,
             # Draw per-stage success probabilities from the same Beta priors
             # Use posterior success_probs for this draw (if available)
             if succ_mat is not None:
-                stage_success_probs = succ_mat[idx]
+                stage_success_probs = succ_mat[idx].astype(float)
             else:
-                stage_success_probs = rng.beta(alphas, betas)
-            # Simulate full progression through all MITRE stages
+                stage_success_probs = rng.beta(alphas, betas).astype(float)
+
+            # --- SAMPLE PER-ATTACKER ADAPTATION FACTOR AND ADJUST SUCCESS PROBS ---
+            # If ADAPTATION_STOCHASTIC is True, draw a unique adaptation factor
+            # for this attacker from ADAPTATION_STOCHASTIC_RANGE; otherwise use
+            # the fixed ADAPTATION_FACTOR.
+            if ADAPTATION_STOCHASTIC:
+                adapt_lo, adapt_hi = ADAPTATION_STOCHASTIC_RANGE
+                attacker_adaptation = float(rng.uniform(adapt_lo, adapt_hi))
+            else:
+                attacker_adaptation = float(ADAPTATION_FACTOR)
+
+            # Convert nominal success -> effective success under this attacker's adaptation.
+            # Original model applies adaptation by scaling the control block:
+            #   block_eff = adaptation * block  where block = 1 - success_nominal
+            # So success_eff = 1 - block_eff = 1 - adaptation * (1 - success_nominal)
+            stage_success_probs = 1.0 - attacker_adaptation * (1.0 - stage_success_probs)
+            # numerical safety: clamp to [0,1]
+            stage_success_probs = np.clip(stage_success_probs, 0.0, 1.0)
+
+            # Optional debug: print sampled adaptation occasionally (uncomment if desired)
+            # if idx % max(1, int(len(lambda_draws)/10)) == 0:
+            #     print(f"Sim idx {idx}: attacker_adaptation={attacker_adaptation:.4f}")
+            # Simulate full progression through all MITRE stages using per-attacker probs
             if _simulate_attacker_path(stage_success_probs, rng):
+
                 # --- draw per-category losses (bounded lognormal + bounded Pareto tails) ---
                 prod = resp = reg = rep = 0.0
 
