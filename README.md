@@ -14,7 +14,7 @@ This repository contains three primary Python scripts that work together to prod
 | `build_mitigation_influence_template.py` | Generates the default mitigation template (`mitigation_influence_template.csv`) from the MITRE ATT&CK dataset. |
 | `mitre_control_strength_dashboard.py` | Calculates per-tactic weighted control strength ranges using the MITRE ATT&CK mappings and user-updated mitigation strengths. |
 | `cyber_incident_pymc.py` | Runs the Bayesian/Monte Carlo cyber loss model using FAIR-based loss categories and the aggregated MITRE control data. |
-| `cyber_incident_pymc.ipynb` | This is a Jupyter Notebooks implemetation of the original version of the script. |
+| `cyber_incident_pymc.ipynb` | This is a Jupyter Notebooks implemetation of a legacy version of the script. It does not utilize the control strengths captured in `mitigation_influence_template.csv` |
 
 ---
 
