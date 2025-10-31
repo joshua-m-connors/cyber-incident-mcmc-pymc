@@ -14,6 +14,16 @@ This repository contains three primary Python scripts that work together to prod
 | `build_mitigation_influence_template.py` | Generates the default mitigation template (`mitigation_influence_template.csv`) from the MITRE ATT&CK dataset. |
 | `mitre_control_strength_dashboard.py` | Calculates per-tactic weighted control strength ranges using the MITRE ATT&CK mappings and user-updated mitigation strengths. |
 | `cyber_incident_pymc.py` | Runs the Bayesian/Monte Carlo cyber loss model using FAIR-based loss categories and the aggregated MITRE control data. |
+| `cyber_incident_pymc.ipynb` | This is a Jupyter Notebooks implemetation of the original version of the script. |
+
+---
+
+## Prerequisite
+
+You will need the following software to run these scripts:
+- Python3
+- PyMC (a Python library for performing Markov Chain Monte Carlo simulation)
+- Jupyter Notebooks (optional - only if you want to run the one Jupyter Notebooks `.ipynb` script)
 
 ---
 
@@ -59,6 +69,7 @@ This repository contains three primary Python scripts that work together to prod
    - Apply Bayesian inference to event frequencies and FAIR-based losses  
    - Generate 2×2 charts, ALE distributions, and exceedance curves  
    - Export results to `/output_YYYY-MM-DD/`
+   - If you have actual observational data (i.e. 3 successful incidents over the last 5 years) those can be entered using the variables `observed_total_incidents` and `observed_years`
 
    **New summary outputs include:**
    - Mean and 95% credible interval for successful incidents per year  
