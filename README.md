@@ -19,7 +19,7 @@ It leverages:
 | `build_technique_relevance_template.py` | Creates a **tactic/technique relevance checklist** that can be pre-populated based on MITRE **procedures (e.g., APT29)** or **campaigns (e.g., C0017)** for focused threat modeling. |
 | `mitre_control_strength_dashboard.py` | Aggregates mitigation-level control strengths into **tactic-level weighted averages**, applying relevance filters and producing an interactive **Plotly dashboard**. |
 | `cyber_incident_pymc.py` | Executes the **Bayesian FAIR–MITRE simulation** using PyMC and Monte Carlo techniques, producing quantitative results such as **AAL**, **SLE**, and **loss exceedance curves**. |
-| `cyber_incident_pymc.ipynb` | This is a legacy Jupyter Notebooks version of the main MCMC modeling script. Keeping it becuase it has some interesting visualizations breaking down the threat actor attack chain progression (e.g. retires, fallbacks, furthest point reached, etc.). |
+| `cyber_incident_pymc.ipynb` | This is a legacy Jupyter Notebooks version of the main MCMC modeling script. Keeping it because it has some interesting visualizations breaking down the threat actor attack chain progression (e.g. retires, fallbacks, furthest point reached, etc.). |
 
 ---
 
