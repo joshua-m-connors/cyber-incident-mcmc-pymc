@@ -1,69 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-=====================================================================================
-MITRE ATT&CK Control Strength Dashboard (Instructional Version)
-=====================================================================================
-This script visualizes the relative control strengths of mitigations across MITRE ATT&CK
-tactics. It combines data from the MITRE ATT&CK STIX bundle and a CSV file of control
-strength ranges to produce a weighted view of security coverage.
-
---------------------------------------------
-KEY FUNCTIONS
---------------------------------------------
-1. **Data Loading:** Extracts attack techniques, mitigations, and relationships from the
-   MITRE ATT&CK dataset.
-2. **Data Merging:** Merges control strength data (from CSV) with MITRE mitigations.
-3. **Weighting Logic:** Adjusts mitigation influence based on type (e.g., Decision Support 
-   or Variance Management (see FAIR-CAM) controls like "Audit" or "User Training" receive 
-   less weight).
-4. **Visualization:** Creates a Plotly grouped bar chart showing minimum and maximum
-   control strength for each MITRE tactic.
-5. **Optional Debug Mode:** Verifies that the normalized influence values sum to ~100%
-   per tactic.
-
---------------------------------------------
-USER-TUNABLE PARAMETERS
---------------------------------------------
-- `DISCOUNT_CONTROLS`: A list of mitigation names to underweight (e.g., user training).
-- `DEBUG_INFLUENCE_SUM`: If True, prints per-tactic influence totals for diagnostic use.
-- `CSV_PATH`: Default input CSV of mitigation control strength values.
-- `OUTPUT_DIR`: Automatically created directory for output charts.
-
---------------------------------------------
-OUTPUTS
---------------------------------------------
-- **HTML dashboard** saved to: `output_YYYY-MM-DD/mitre_tactic_strengths_<timestamp>.html`
-- **Console table** of average strength per tactic.
-- **Optional debug messages** (if `DEBUG_INFLUENCE_SUM=True`).
-
---------------------------------------------
-PURPOSE
---------------------------------------------
-This tool is typically used as an intermediate diagnostic and visualization step before
-running quantitative simulations (e.g., PyMC-based FAIR risk models). It allows users to
-see which tactics have stronger or weaker defensive coverage based on weighted averages
-of mitigation effectiveness.
-=====================================================================================
+MITRE ATT&CK Control Strength Dashboard — Stable Hover Edition
+- Multiline hover via per-point hovertemplate (array of strings)
+- Plain-text bullet list (•) with <br> separators (no HTML containers)
+- Caps hover items to prevent off-screen overflow (top 20 + "… and N more")
+- Unified hover; Min bar hover disabled
 """
 
+from __future__ import annotations
 import os
-import sys
 import json
 import random
 import datetime
+import argparse
+from typing import Dict, List, Tuple, Set, Optional
+from collections import defaultdict
+
 import pandas as pd
 import plotly.graph_objects as go
 
-# ──────────────────────────────────────────────────────────────────────────────
-# USER CONFIGURATION PARAMETERS
-# ──────────────────────────────────────────────────────────────────────────────
-QUIET_MODE = not sys.argv[0].endswith("mitre_control_strength_dashboard.py")
-DEBUG_INFLUENCE_SUM = False  # ← Set to True to print influence normalization checks
-
-# NOTE: You can modify this list to discount the influence of certain controls
-# that are broad or less direct (e.g., training, auditing, or intelligence programs).
-DISCOUNT_CONTROLS = [
+# ----------------------- Config -----------------------
+DISCOUNT_CONTROLS: List[str] = [
     "audit",
     "vulnerability scanning",
     "user training",
@@ -71,75 +29,35 @@ DISCOUNT_CONTROLS = [
     "application developer guidance",
 ]
 
-# Default input dataset and CSV (you can override these if needed)
 DATASET_PATH = "enterprise-attack.json"
 CSV_PATH = "mitigation_control_strengths.csv"
+USE_RELEVANCE_CSV = True
+TECHNIQUE_RELEVANCE_FILE = "technique_relevance.csv"
+MAX_HOVER_ITEMS = 20  # cap number of mitigation lines shown per tactic
 
-# ──────────────────────────────────────────────────────────────────────────────
-# OUTPUT DIRECTORY SETUP
-# ──────────────────────────────────────────────────────────────────────────────
-today = datetime.date.today().strftime("%Y-%m-%d")
-OUTPUT_DIR = os.path.join(os.getcwd(), f"output_{today}")
+TODAY_STR = datetime.date.today().strftime("%Y-%m-%d")
+OUTPUT_DIR = os.path.join(os.getcwd(), f"output_{TODAY_STR}")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ──────────────────────────────────────────────────────────────────────────────
-def log(message):
-    """Helper function for controlled console printing."""
-    if not QUIET_MODE:
-        print(message)
+def log(msg: str, quiet: bool = False):
+    if not quiet:
+        print(msg)
 
-# ──────────────────────────────────────────────────────────────────────────────
-def _load_stix_objects(dataset_path):
-    """Load STIX data from a MITRE ATT&CK JSON bundle.
-
-    Args:
-        dataset_path (str): Path to ATT&CK bundle (e.g., enterprise-attack.json)
-    Returns:
-        tuple(dict, dict, list): (techniques, mitigations, relationships)
-    """
+def load_stix_objects(dataset_path: str):
     with open(dataset_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-
     techniques, mitigations, relationships = {}, {}, []
-
-    for obj in data["objects"]:
-        if obj["type"] == "attack-pattern":
+    for obj in data.get("objects", []):
+        t = obj.get("type")
+        if t == "attack-pattern":
             techniques[obj["id"]] = obj
-        elif obj["type"] == "course-of-action":
+        elif t == "course-of-action":
             mitigations[obj["id"]] = obj
-        elif obj["type"] == "relationship" and obj.get("relationship_type") == "mitigates":
+        elif t == "relationship" and obj.get("relationship_type") == "mitigates":
             relationships.append(obj)
-
     return techniques, mitigations, relationships
 
-# ──────────────────────────────────────────────────────────────────────────────
-def get_mitre_tactic_strengths(dataset_path=DATASET_PATH, csv_path=CSV_PATH,
-                               seed=42, build_figure=True):
-    """Main function: compute weighted control strengths and optionally build dashboard.
-
-    Args:
-        dataset_path (str): Path to MITRE ATT&CK JSON dataset.
-        csv_path (str): Path to mitigation control strength CSV.
-        seed (int): Random seed for deterministic weighting.
-        build_figure (bool): If True, create a Plotly dashboard.
-
-    Returns:
-        tuple(pd.DataFrame, plotly.Figure | None):
-            - DataFrame of averaged control strengths by tactic.
-            - Plotly figure (if generated).
-    """
-    random.seed(seed)
-    ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
-    # STEP 1: Load MITRE dataset objects (techniques, mitigations, relationships)
-    try:
-        techniques, mitigations, relationships = _load_stix_objects(dataset_path)
-        log(f"\033[92m✅ Loaded {len(mitigations)} mitigations from dataset\033[0m")
-    except Exception as e:
-        log(f"\033[93m⚠️ Failed to load MITRE dataset: {e}\033[0m")
-        return pd.DataFrame(), None
-
-    # STEP 2: Build tactic → mitigations mapping
+def build_tactic_map_full(techniques, mitigations, relationships):
     tactic_map = {}
     for rel in relationships:
         src, tgt = rel.get("source_ref"), rel.get("target_ref")
@@ -149,103 +67,95 @@ def get_mitre_tactic_strengths(dataset_path=DATASET_PATH, csv_path=CSV_PATH,
                 tactic = ref.get("phase_name", "").replace("-", " ").title()
                 if tactic:
                     tactic_map.setdefault(tactic, []).append(src)
+    return tactic_map
 
-    # STEP 3: Load control strength data from CSV (if available)
-    try:
-        csv = pd.read_csv(csv_path)
-        csv["Mitigation_ID"] = csv["Mitigation_ID"].astype(str).str.strip().str.lower()
+def build_tactic_map_filtered(techniques, mitigations, relationships, technique_ids_keep: Set[str], tactics_keep: Set[str]):
+    tactic_map = {}
+    for rel in relationships:
+        src, tgt = rel.get("source_ref"), rel.get("target_ref")
+        if src in mitigations and tgt in techniques:
+            tech = techniques[tgt]
+            ext_tid = next((r.get("external_id", "").strip()
+                            for r in tech.get("external_references", [])
+                            if r.get("source_name") == "mitre-attack"), None)
+            if not ext_tid or ext_tid not in technique_ids_keep:
+                continue
+            for ref in tech.get("kill_chain_phases", []):
+                tactic = ref.get("phase_name", "").replace("-", " ").title()
+                if tactic and tactic in tactics_keep:
+                    tactic_map.setdefault(tactic, []).append(src)
+    return {t: m for t, m in tactic_map.items() if m}
 
-        # Build quick lookup dictionary for min/max control strengths
-        csv_map = {}
-        for mid, lo, hi in zip(csv["Mitigation_ID"], csv["Control_Min"], csv["Control_Max"]):
-            csv_map[mid] = (float(lo), float(hi))
-            if mid.startswith("m") and len(mid) <= 6:
-                csv_map[mid.replace(" ", "").lower()] = (float(lo), float(hi))
+def load_relevance_filter(file_path: str):
+    df = pd.read_csv(file_path)
+    norm = {c: c.lower().replace(" ", "").replace("_", "") for c in df.columns}
+    tactic_col = next((o for o, n in norm.items() if n == "tactic"), None)
+    tech_col = next((o for o, n in norm.items() if n in {"techniqueid", "technique"}), None)
+    mark_col = next((o for o, n in norm.items() if n in {"relevant", "include", "selected"}), None)
+    if not tactic_col or not tech_col:
+        raise ValueError("technique_relevance.csv must include 'Tactic' and 'Technique ID'.")
+    if not mark_col:
+        raise ValueError("Missing relevance column (e.g., 'Relevant').")
+    mask = df[mark_col].astype(str).str.strip().str.upper().eq("X")
+    kept = df.loc[mask, [tactic_col, tech_col]].copy()
+    kept[tactic_col] = kept[tactic_col].astype(str).str.strip()
+    kept[tech_col] = kept[tech_col].astype(str).str.strip()
+    return set(kept[tech_col].dropna().unique()), set(kept[tactic_col].dropna().unique())
 
-        log(f"\033[92m✅ Loaded {len(csv_map)} mitigation strengths from {csv_path}\033[0m")
-    except Exception as e:
-        log(f"\033[93m⚠️ Could not load mitigation strengths ({e})\033[0m")
-        csv_map = {}
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # STEP 4: Compute average min/max strengths per tactic
-    rows, summary_rows = [], []
-
+def compute_tactic_strengths(tactic_map, mitigations, strengths_map, discount_controls=None):
+    discount_controls = discount_controls or []
+    detail_rows, summary_rows = [], []
     for tactic, mit_ids in tactic_map.items():
         if not mit_ids:
-            rows.append((tactic, 0.0, 0.0, "No linked mitigations"))
+            detail_rows.append((tactic, 0.0, 0.0, []))
             summary_rows.append((tactic, 0.0, 0.0, 0))
             continue
 
-        weighted = []
-
-        # Iterate over each mitigation linked to this tactic
+        # collect (name, lo, hi, w) per relationship
+        entries = []
         for mid in mit_ids:
             mit = mitigations[mid]
-
-            # Extract external MITRE ID (e.g., M1030)
-            ext_id = None
-            for ref in mit.get("external_references", []):
-                if ref.get("source_name") == "mitre-attack":
-                    ext_id = ref.get("external_id", "").strip().lower()
-                    break
-
-            # Retrieve control strength range (default to 30–70 if missing)
-            lo, hi = (
-                csv_map.get(mid.lower())
-                or (csv_map.get(ext_id) if ext_id else None)
-                or (30.0, 70.0)
-            )
-
-            name = mit["name"]
-
-            # Apply weighting factor (discounting generic mitigations)
+            name = mit.get("name", "Unknown Mitigation")
             name_lower = name.lower()
+            ext_id = next((r.get("external_id", "").strip().lower()
+                           for r in mit.get("external_references", [])
+                           if r.get("source_name") == "mitre-attack"), None)
+            lo, hi = strengths_map.get(mid.lower()) or strengths_map.get(ext_id) or (30.0, 70.0)
             if "do not mitigate" in name_lower:
-                lo, hi = 0.0, 0.0
-                weight_factor = 1.0
-            elif any(ctrl in name_lower for ctrl in DISCOUNT_CONTROLS):
-                weight_factor = 0.5
+                lo, hi, w = 0.0, 0.0, 1.0
+            elif any(k in name_lower for k in discount_controls):
+                w = 0.5
             else:
-                weight_factor = 1.0
+                w = 1.0
+            entries.append((name, lo, hi, w))
 
-            weighted.append((lo, hi, name, weight_factor))
+        # aggregate duplicates by name
+        agg = defaultdict(lambda: [0.0, 0.0, 0.0])
+        for name, lo, hi, w in entries:
+            agg[name][0] += lo * w
+            agg[name][1] += hi * w
+            agg[name][2] += w
 
-        # Weighted averages (normalized by total influence weight)
-        total_weight = max(1e-9, sum(w[3] for w in weighted))
-        avg_min = sum(w[0] * w[3] for w in weighted) / total_weight
-        avg_max = sum(w[1] * w[3] for w in weighted) / total_weight
+        weighted_unique = []
+        for name, (sum_lo, sum_hi, sum_w) in agg.items():
+            avg_lo = sum_lo / max(1e-9, sum_w)
+            avg_hi = sum_hi / max(1e-9, sum_w)
+            weighted_unique.append((avg_lo, avg_hi, name, sum_w))
 
-        # Construct hover text showing per-mitigation influence
-        hover_dict = {}
-        for lo, hi, name, weight_factor in weighted:
-            if name not in hover_dict:
-                hover_dict[name] = {"lo": lo, "hi": hi, "count": 1, "weight": weight_factor}
-            else:
-                hover_dict[name]["lo"] = (hover_dict[name]["lo"] + lo) / 2
-                hover_dict[name]["hi"] = (hover_dict[name]["hi"] + hi) / 2
-                hover_dict[name]["count"] += 1
-                hover_dict[name]["weight"] += weight_factor
+        # tactic-level averages
+        total_w = max(1e-9, sum(w for *_, w in weighted_unique))
+        avg_min = sum(lo * w for lo, hi, n, w in weighted_unique) / total_w
+        avg_max = sum(hi * w for lo, hi, n, w in weighted_unique) / total_w
 
-        # Normalize influence percentages (for hover display)
-        total_weighted_refs = sum(v["weight"] for v in hover_dict.values())
-        details = [
-            f"{name}: {v['lo']:.1f}–{v['hi']:.1f}% (influence {100*v['weight']/total_weighted_refs:.1f}%)"
-            for name, v in sorted(hover_dict.items())
-        ]
-        hover_text = "<br>".join(details)
+        # build mitigation lines sorted by influence desc
+        items_sorted = sorted(weighted_unique, key=lambda t: t[3], reverse=True)
+        lines = [f"{n}: {lo:.1f}–{hi:.1f}% (influence {(w/total_w)*100.0:.1f}%)"
+                 for lo, hi, n, w in items_sorted]
 
-        # Optional debug verification
-        if DEBUG_INFLUENCE_SUM:
-            influence_sum = sum(100 * v["weight"] / total_weighted_refs for v in hover_dict.values())
-            log(f"[DEBUG] {tactic}: Total influence = {influence_sum:.2f}%")
+        detail_rows.append((tactic, avg_min, avg_max, lines))
+        summary_rows.append((tactic, avg_min, avg_max, len(items_sorted)))
 
-        rows.append((tactic, avg_min, avg_max, hover_text))
-        summary_rows.append((tactic, avg_min, avg_max, len(weighted)))
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # STEP 5: Convert results to DataFrames and order by ATT&CK flow
-    df = pd.DataFrame(rows, columns=["Tactic", "MinStrength", "MaxStrength", "MitigationList"])
+    detail_df = pd.DataFrame(detail_rows, columns=["Tactic", "MinStrength", "MaxStrength", "MitigationLines"])
     summary_df = pd.DataFrame(summary_rows, columns=["Tactic", "MinStrength", "MaxStrength", "MitigationCount"])
 
     order = [
@@ -253,68 +163,201 @@ def get_mitre_tactic_strengths(dataset_path=DATASET_PATH, csv_path=CSV_PATH,
         "Defense Evasion", "Credential Access", "Discovery", "Lateral Movement",
         "Collection", "Command And Control", "Exfiltration", "Impact"
     ]
-
-    for d in (df, summary_df):
+    for d in (detail_df, summary_df):
         d["Tactic"] = pd.Categorical(d["Tactic"], categories=order, ordered=True)
         d.dropna(subset=["Tactic"], inplace=True)
         d.sort_values("Tactic", inplace=True)
         d.reset_index(drop=True, inplace=True)
 
-    # Print tabular summary to console
-    if not QUIET_MODE:
-        log("\n--- Weighted Control Strengths (ordered by MITRE flow) ---")
-        log(summary_df.to_string(index=False))
+    return detail_df, summary_df
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # STEP 6: Plot visualization (grouped bar chart)
-    fig = None
-    if build_figure:
+def get_mitre_tactic_strengths(dataset_path: str = DATASET_PATH,
+                               csv_path: str = CSV_PATH,
+                               seed: int = 42,
+                               build_figure: bool = True,
+                               use_relevance: bool = False,
+                               relevance_file: str = TECHNIQUE_RELEVANCE_FILE,
+                               quiet: bool = False):
+    random.seed(seed)
+    ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    try:
+        techniques, mitigations, relationships = load_stix_objects(dataset_path)
+        log(f"✅ Loaded {len(mitigations)} mitigations and {len(relationships)} relationships.", quiet)
+    except Exception as e:
+        log(f"⚠️ Failed to load dataset: {e}", quiet)
+        return pd.DataFrame(), pd.DataFrame(), {}, {}, {}
+
+    if use_relevance and os.path.exists(relevance_file):
+        try:
+            tech_keep, tact_keep = load_relevance_filter(relevance_file)
+            tactic_map = build_tactic_map_filtered(techniques, mitigations, relationships, tech_keep, tact_keep)
+            log(f"✅ FILTERED mode — {len(tech_keep)} techniques, {len(tact_keep)} tactics.", quiet)
+        except Exception as e:
+            log(f"⚠️ Filter load error ({e}) — reverting to FULL mode.", quiet)
+            tactic_map = build_tactic_map_full(techniques, mitigations, relationships)
+            use_relevance = False
+    else:
+        tactic_map = build_tactic_map_full(techniques, mitigations, relationships)
+        log("⚙️ FULL mode (no filtering).", quiet)
+
+    if use_relevance and not tactic_map:
+        log("⚠️ No tactics retained after filtering.", quiet)
+        return pd.DataFrame(), pd.DataFrame(), {}, {}, {}
+
+    try:
+        csv = pd.read_csv(csv_path)
+        csv["Mitigation_ID"] = csv["Mitigation_ID"].astype(str).str.strip().str.lower()
+        csv_map = {mid: (float(lo), float(hi))
+                   for mid, lo, hi in zip(csv["Mitigation_ID"], csv["Control_Min"], csv["Control_Max"])}
+        log(f"✅ Loaded {len(csv_map)} mitigation strengths.", quiet)
+    except Exception as e:
+        log(f"⚠️ Could not load strengths ({e}) — defaulting to 30–70%.", quiet)
+        csv_map = {}
+
+    detail_df, summary_df = compute_tactic_strengths(tactic_map, mitigations, csv_map, DISCOUNT_CONTROLS)
+
+    # impact-reduction controls
+    impact_reduction_controls = {}
+    for mit in mitigations.values():
+        name_lower = mit.get("name", "").lower()
+        if "data backup" in name_lower or "encrypt sensitive information" in name_lower:
+            ext_id = next((r.get("external_id", "").strip().lower()
+                           for r in mit.get("external_references", [])
+                           if r.get("source_name") == "mitre-attack"), None)
+            lo, hi = csv_map.get(ext_id) or (30.0, 70.0)
+            impact_reduction_controls[mit["name"]] = {
+                "min_strength": lo,
+                "max_strength": hi,
+                "mean_strength": (lo + hi) / 2
+            }
+
+    control_strength_map = {
+        row["Tactic"]: {
+            "min_strength": row["MinStrength"],
+            "max_strength": row["MaxStrength"],
+            "mean_strength": (row["MinStrength"] + row["MaxStrength"]) / 2,
+            "mitigation_count": int(row["MitigationCount"])
+        }
+        for _, row in summary_df.iterrows()
+    }
+    relevance_metadata = {"mode": "Filtered" if use_relevance else "Full",
+                          "included_tactics": list(summary_df["Tactic"]),
+                          "timestamp": ts}
+
+    # ---------- Visualization ----------
+    if build_figure and not detail_df.empty:
+        # Build per-point hovertemplate strings (fully formatted; no HTML containers)
+        hover_templates = []
+        for _, row in detail_df.iterrows():
+            lines = row["MitigationLines"]
+            extra = ""
+            if len(lines) > MAX_HOVER_ITEMS:
+                extra_count = len(lines) - MAX_HOVER_ITEMS
+                lines = lines[:MAX_HOVER_ITEMS]
+                extra = f"<br>… and {extra_count} more"
+            bullets = "<br>".join(f"• {ln}" for ln in lines)
+            hover_templates.append(
+                "Tactic: %{x}<br>"
+                f"Min Strength: {row['MinStrength']:.1f}%<br>"
+                f"Max Strength: {row['MaxStrength']:.1f}%<br><br>"
+                f"Mitigations:<br>{bullets}{extra}<extra></extra>"
+            )
+
         fig = go.Figure()
         fig.add_trace(go.Bar(
-            x=df["Tactic"],
-            y=df["MinStrength"],
+            x=detail_df["Tactic"],
+            y=detail_df["MinStrength"],
             name="Min Strength (%)",
             marker_color="skyblue",
-            hovertext=df["MitigationList"],
-            hoverinfo="text+y"
+            hoverinfo="skip"
         ))
         fig.add_trace(go.Bar(
-            x=df["Tactic"],
-            y=df["MaxStrength"],
+            x=detail_df["Tactic"],
+            y=detail_df["MaxStrength"],
             name="Max Strength (%)",
             marker_color="steelblue",
-            hovertext=df["MitigationList"],
-            hoverinfo="text+y"
+            hovertemplate=hover_templates  # per-point fully formatted text
         ))
 
-        # Layout customization for readability
+        mode_suffix = " (Filtered)" if use_relevance else " (Full)"
         fig.update_layout(
-            title="Weighted MITRE ATT&CK Control Strengths by Tactic",
+            title=f"Weighted MITRE ATT&CK Control Strengths by Tactic{mode_suffix}",
             xaxis_title="Tactic",
             yaxis_title="Control Strength (%)",
             barmode="group",
             template="plotly_white",
             height=650,
-            hoverlabel=dict(font_size=11, font_family="Courier New")
+            hovermode="x unified",
+            hoverlabel=dict(namelength=-1, font_size=11)  # keep labels compact
         )
+        html_path = os.path.join(OUTPUT_DIR, f"mitre_tactic_strengths_{ts}.html")
+        fig.write_html(html_path)
+        log(f"✅ Chart saved → {html_path}", quiet)
 
-        # Optional enhanced hover clarity
-        fig.update_traces(
-            hovertemplate="<b>%{x}</b><br>%{fullData.name}: %{y:.1f}%<br>%{customdata}<extra></extra>",
-            customdata=df["MitigationList"],
-            hoverlabel=dict(namelength=-1, font_size=11, font_family="Courier New")
-        )
+    # Save summary CSV
+    summary_out = summary_df.copy()
+    summary_out.insert(0, "Mode", relevance_metadata["mode"])
+    summary_out["Timestamp"] = ts
+    out_csv = os.path.join(OUTPUT_DIR, f"filtered_summary_{ts}.csv")
+    summary_out.to_csv(out_csv, index=False)
+    log(f"✅ Summary CSV saved → {out_csv}", quiet)
 
-        # Save dashboard to HTML
-        fig_path = os.path.join(OUTPUT_DIR, f"mitre_tactic_strengths_{ts}.html")
-        fig.write_html(fig_path)
-        log(f"\033[92m✅ Chart saved → {fig_path}\033[0m")
+    # --- Apply approved gating logic for impact reduction controls ---
+    # Encryption mitigation only applies if Exfiltration tactic is in scope
+    if 'Exfiltration' not in summary_df['Tactic'].values and 'Encrypt Sensitive Information' in impact_reduction_controls:
+        impact_reduction_controls['Encrypt Sensitive Information']['min_strength'] = 0.0
+        impact_reduction_controls['Encrypt Sensitive Information']['max_strength'] = 0.0
+        impact_reduction_controls['Encrypt Sensitive Information']['mean_strength'] = 0.0
 
-        if not QUIET_MODE:
-            fig.show()
+    # Data Backup mitigation only applies if one or more in-scope Impact techniques map to Data Backup
+    has_backup_in_impact = False
+    try:
+        impact_rows = detail_df[detail_df['Tactic'] == 'Impact']
+        if not impact_rows.empty:
+            lines = impact_rows.iloc[0]['MitigationLines']
+            if isinstance(lines, (list, tuple)):
+                has_backup_in_impact = any('data backup' in str(ln).lower() for ln in lines)
+            else:
+                has_backup_in_impact = 'data backup' in str(lines).lower()
+    except Exception:
+        has_backup_in_impact = False
 
-    return df, fig
+    if not has_backup_in_impact and 'Data Backup' in impact_reduction_controls:
+        impact_reduction_controls['Data Backup']['min_strength'] = 0.0
+        impact_reduction_controls['Data Backup']['max_strength'] = 0.0
+        impact_reduction_controls['Data Backup']['mean_strength'] = 0.0
 
-# ──────────────────────────────────────────────────────────────────────────────
+    return detail_df, summary_df, control_strength_map, relevance_metadata, impact_reduction_controls
+
+def parse_args():
+    p = argparse.ArgumentParser(description="MITRE ATT&CK Control Strength Dashboard")
+    p.add_argument("--dataset", "-d", default=DATASET_PATH)
+    p.add_argument("--strengths", "-s", default=CSV_PATH)
+    p.add_argument("--use-relevance", "-r", action="store_true")
+    p.add_argument("--relevance-file", "-f", default=TECHNIQUE_RELEVANCE_FILE)
+    p.add_argument("--no-figure", action="store_true")
+    p.add_argument("--show-figure", action="store_true")
+    p.add_argument("--quiet", action="store_true")
+    return p.parse_args()
+
 if __name__ == "__main__":
-    df, fig = get_mitre_tactic_strengths(build_figure=True)
+    args = parse_args()
+    detail_df, summary_df, control_map, meta, impact_controls = get_mitre_tactic_strengths(
+        dataset_path=args.dataset,
+        csv_path=args.strengths,
+        seed=42,
+        build_figure=not args.no_figure,
+        use_relevance=args.use_relevance or USE_RELEVANCE_CSV,
+        relevance_file=args.relevance_file,
+        quiet=args.quiet,
+    )
+
+    if args.show_figure and not args.no_figure and not detail_df.empty:
+        try:
+            html_file = os.path.join(OUTPUT_DIR, f"mitre_tactic_strengths_{meta['timestamp']}.html")
+            if os.path.exists(html_file):
+                import webbrowser
+                webbrowser.open_new_tab(f"file://{html_file}")
+        except Exception:
+            pass
