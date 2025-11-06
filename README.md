@@ -1,183 +1,313 @@
-# Cyber Risk Simulation Framework  
+# Cyber Risk Simulation Framework
+
 ### *(FAIR + MITRE ATT&CK Integrated Quantitative Model)*
 
-This framework integrates **Factor Analysis of Information Risk (FAIR)** principles with the **MITRE ATT&CK** framework to estimate cyber risk using **Bayesian inference**, **Monte Carlo simulation**, and **weighted control strength analytics**.  
+This program operationalizes **Factor Analysis of Information Risk
+(FAIR)** principles using the **MITRE ATT&CK** framework to produce
+quantitative cyber risk estimates.
 
-It provides an end-to-end process to generate control strength data, calibrate it to organizational relevance, and quantify **annualized loss exposure (AAL)**, **incident frequency**, and **Single Loss Expectancy (SLE)**.
+It leverages: - MITRE ATT&CK data for **threat realism and control
+mapping**.\
+- FAIR for **loss magnitude and frequency modeling**.\
+- **Bayesian inference (PyMC)** and **Monte Carlo simulation** for
+uncertainty propagation.\
+- A complete data pipeline from ATT&CK → control strengths → simulated
+loss distributions.
 
----
+------------------------------------------------------------------------
 
-## 🧭 Overview
+## 🧭 Framework Overview
 
-| Script | Purpose |
-|--------|----------|
-| `build_mitigation_influence_template.py` | Creates a baseline mitigation template (`mitigation_influence_template.csv`) derived from the MITRE ATT&CK dataset, seeding initial control strengths and influence weights. |
-| `build_technique_relevance_template.py` | Generates `technique_relevance.csv`, which lets analysts mark relevant MITRE techniques (by Tactic) for specific **threat actors** or **campaigns** (e.g., APT29, C0017). |
-| `mitre_control_strength_dashboard.py` | Aggregates mitigation-level strengths into tactic-level weighted ranges and produces an interactive Plotly dashboard (per MITRE tactic). Includes logic to gate “impact-reduction” mitigations (Backups, Encryption). |
-| `cyber_incident_pymc.py` | Runs the **FAIR-MITRE hybrid risk model**, combining Bayesian inference (PyMC) with stochastic attacker simulations, adaptability logic, and FAIR loss distributions to estimate AAL, credible intervals, and exceedance curves. |
+  ----------------------------------------------------------------------------------------
+  Script                                         Function
+  ---------------------------------------------- -----------------------------------------
+  **`build_mitigation_influence_template.py`**   Builds a baseline **mitigation influence
+                                                 matrix**, quantifying which ATT&CK
+                                                 mitigations cover which
+                                                 techniques/tactics and generating a seed
+                                                 control-strength CSV.
 
----
+  **`build_technique_relevance_template.py`**    Creates a **tactic/technique relevance
+                                                 checklist** that can be pre-populated
+                                                 based on MITRE **procedures (e.g.,
+                                                 APT29)** or **campaigns (e.g., C0017)**
+                                                 for focused threat modeling.
 
-## ⚙️ Workflow Summary
+  **`mitre_control_strength_dashboard.py`**      Aggregates mitigation-level control
+                                                 strengths into **tactic-level weighted
+                                                 averages**, applying relevance filters
+                                                 and producing an interactive **Plotly
+                                                 dashboard**.
 
-### 1. Get the MITRE ATT&CK dataset  
-Download and place the **Enterprise ATT&CK JSON** file into your working directory:
+  **`cyber_incident_pymc.py`**                   Executes the **Bayesian FAIR--MITRE
+                                                 simulation** using PyMC and Monte Carlo
+                                                 techniques, producing quantitative
+                                                 results such as **AAL**, **SLE**, and
+                                                 **loss exceedance curves**.
+  ----------------------------------------------------------------------------------------
 
-```bash
+------------------------------------------------------------------------
+
+## ⚙️ Full Workflow
+
+### 1. Acquire MITRE ATT&CK Enterprise Dataset
+
+Download the latest ATT&CK Enterprise bundle:
+
+``` bash
 wget https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json
 ```
 
----
+Ensure it resides in the same working directory as the scripts.
 
-### 2. Build the mitigation influence template  
-Generates a baseline of all MITRE mitigations, their coverage, and initial strength ranges:
+------------------------------------------------------------------------
 
-```bash
+### 2. Generate the Mitigation Influence Template
+
+Constructs a foundational view of all ATT&CK mitigations and their
+influence.
+
+``` bash
 python3 build_mitigation_influence_template.py
 ```
 
-Output:
-- `mitigation_influence_template.csv` — editable baseline of all mitigations
-- Log file saved under `/output_YYYY-MM-DD/`
+Outputs: - **`mitigation_influence_template.csv`** --- baseline
+mitigation/control strength seed values.\
+- **`/output_YYYY-MM-DD/mitigation_template_build_log_*.txt`** --- run
+log.
 
-You can manually tune `Control_Min` and `Control_Max` in this CSV (e.g., based on internal maturity).
+You can manually refine the `Control_Min` / `Control_Max` columns to
+reflect assessed control maturity.
 
----
+------------------------------------------------------------------------
 
-### 3. (Optional) Scope the model to relevant threat campaigns or actors  
-Automatically marks techniques used by one or more specific **procedures** (e.g., APT29, FIN7) or **campaigns** (e.g., C0017):
+### 3. Build Technique Relevance Template (Optional)
 
-```bash
+Scopes the model to specific **threat actors or campaigns**, marking
+relevant techniques automatically.
+
+``` bash
 python3 build_technique_relevance_template.py --procedure "APT29" --campaign C0017
 ```
 
-Output:
-- `/output_YYYY-MM-DD/technique_relevance.csv` — all tactics/techniques with “Relevant” column pre-marked  
-- `/output_YYYY-MM-DD/technique_relevance_evidence.json` — audit evidence of what was auto-selected  
+Outputs: - `/output_YYYY-MM-DD/technique_relevance.csv` ---
+Tactic/Technique checklist with "Relevant" marks.\
+- `/output_YYYY-MM-DD/technique_relevance_evidence.json` --- JSON
+evidence of auto-selections.
 
-This file can later be manually refined to mark additional techniques.
+You may open `technique_relevance.csv` to manually adjust relevance
+(mark additional `X`s).
 
----
+------------------------------------------------------------------------
 
-### 4. Generate the control strength dashboard  
-Aggregates mitigations → tactics and visualizes their weighted control strength ranges:
+### 4. Generate Control Strength Dashboard
 
-```bash
+Aggregates and visualizes the strength of mitigations per MITRE tactic.\
+Optionally filters by relevance from the previous step.
+
+``` bash
 python3 mitre_control_strength_dashboard.py
 ```
 
-Features:
-- Weighted average of mitigation strengths within each MITRE tactic.  
-- Discounts generic controls (e.g., “Audit”, “User Training”).  
-- Caps hover list to top 20 mitigations (with “… and N more”).  
-- Auto-detects and applies `technique_relevance.csv` if present.  
-- Automatically zeroes out impact-reduction mitigations **not in scope**:
-  - “Encrypt Sensitive Information” → only if *Exfiltration* tactic is in scope.
-  - “Data Backup” → only if mapped to one or more *Impact* techniques.
+Features: - Weighted mean/min/max of mitigations per tactic.\
+- Discounts generic controls (Audit, User Training, etc.).\
+- Caps hover lists (top 20 mitigations per tactic + "... and N more").\
+- Auto-detects and applies `technique_relevance.csv` if present.\
+- Applies **impact mitigation gating logic**: - "Encrypt Sensitive
+Information" only applies if *Exfiltration* is in scope.\
+- "Data Backup" only applies if *Impact* includes backup-related
+techniques.
 
-Outputs:
-- Interactive HTML dashboard: `/output_YYYY-MM-DD/mitre_tactic_strengths_*.html`
-- Summary CSV: `/output_YYYY-MM-DD/filtered_summary_*.csv`
-- (Used directly by `cyber_incident_pymc.py`)
+Outputs: - `/output_YYYY-MM-DD/mitre_tactic_strengths_*.html` ---
+interactive dashboard.\
+- `/output_YYYY-MM-DD/filtered_summary_*.csv` --- per-tactic weighted
+control strengths.\
+- These feed directly into the risk model script.
 
----
+------------------------------------------------------------------------
 
-### 5. Run the FAIR-MITRE Bayesian Risk Model
+### 5. Run the FAIR--MITRE Bayesian Risk Model
 
-```bash
+Combines the control strengths, threat relevance, and FAIR-based loss
+modeling.
+
+``` bash
 python3 cyber_incident_pymc.py --print-control-strengths
 ```
 
-This performs:
-- Bayesian inference of **attack frequency (λ)** using a lognormal prior.  
-- **Per-tactic success probability** sampling from Beta distributions informed by MITRE control strengths.  
-- **Monte Carlo simulation** of attacker progressions with retries, detection, and fallbacks.  
-- Stochastic **adaptability and threat capability** per attacker chain.  
-- FAIR-style loss modeling (lognormal bodies + bounded Pareto tails).  
-- Optional stochastic sampling of impact-reduction mitigations (Backups, Encryption).  
+Core capabilities: - Bayesian inference for **attack frequency (λ)**.\
+- **Beta-distributed per-tactic success probabilities**, driven by
+control strengths.\
+- Simulation of multi-stage attacker progressions (retries, detection,
+fallbacks).\
+- Stochastic **adaptability** and **threat capability** per attacker.\
+- FAIR-style losses: lognormal core + Pareto tails for Legal and
+Reputation.\
+- Dynamic **impact reduction** for Backup and Encryption mitigations.
 
-Outputs:
-- Summary and detailed CSVs under `/output_YYYY-MM-DD/`
-- Diagnostic dashboard PNGs (2×2 view, log histogram, exceedance curve)
-- Optional control-parameter CSV if `--print-control-strengths` used
+Outputs: - **CSV files** (results and summaries).\
+- **2×2 dashboard**, **log-scale ALE histogram**, and **Loss Exceedance
+Curve (LEC)** plots.\
+- Optional control-strength parameter CSV if `--print-control-strengths`
+is specified.
 
----
+------------------------------------------------------------------------
 
 ## 🧩 Command-Line Options
 
-### `cyber_incident_pymc.py`
+### `build_mitigation_influence_template.py`
 
-| Flag | Description | Example |
-|------|--------------|----------|
-| `--dataset PATH` | MITRE ATT&CK STIX bundle path. | `--dataset enterprise-attack.json` |
-| `--csv PATH` | Control strength file (defaults to `mitigation_control_strengths.csv`). | `--csv ./mitigation_control_strengths.csv` |
-| `--print-control-strengths` | Prints and exports per-tactic control parameters used. | `--print-control-strengths` |
-| `--no-adapt-stochastic` | Disables stochastic adaptability; uses fixed mean adaptability factor. | `--no-adapt-stochastic` |
-| `--no-stochastic-impact` | Disables stochastic sampling of impact-reduction controls. | `--no-stochastic-impact` |
-| `--no-plot` | Suppresses chart display (still saves images). | `--no-plot` |
+  -----------------------------------------------------------------------
+  Option                    Description
+  ------------------------- ---------------------------------------------
+  *(none)*                  Generates the baseline mitigation influence
+                            CSV and build log.
 
----
+  `--dataset PATH`          (Optional) Path to `enterprise-attack.json`
+                            (default: current directory).
+  -----------------------------------------------------------------------
 
-### `mitre_control_strength_dashboard.py`
-
-| Flag | Description | Example |
-|------|--------------|----------|
-| `--dataset PATH` | MITRE ATT&CK JSON dataset path. | `--dataset enterprise-attack.json` |
-| `--strengths PATH` | Mitigation control strength CSV. | `--strengths ./mitigation_control_strengths.csv` |
-| `--use-relevance` | Enables relevance filtering (auto-detects if file present). | `--use-relevance` |
-| `--relevance-file PATH` | Specify alternate relevance CSV file. | `--relevance-file ./output_2025-10-31/technique_relevance.csv` |
-| `--no-figure` | Run headless (no chart output). | `--no-figure` |
-| `--show-figure` | Opens the generated HTML dashboard automatically. | `--show-figure` |
-
----
+------------------------------------------------------------------------
 
 ### `build_technique_relevance_template.py`
 
-| Flag | Description | Example |
-|------|--------------|----------|
-| `--procedure NAME` | Include all techniques used by this threat actor, malware, or tool. | `--procedure "APT29"` |
-| `--campaign Cxxxx` | Include all techniques used in this MITRE campaign. | `--campaign C0017` |
-| `--mark-all all` | Mark all techniques as relevant. | `--mark-all all` |
-| `--dedupe-names` | Deduplicate duplicate technique names within each tactic. | `--dedupe-names` |
+  ----------------------------------------------------------------------------
+  Option               Description                     Example
+  -------------------- ------------------------------- -----------------------
+  `--procedure NAME`   Auto-mark techniques used by an `--procedure "APT29"`
+                       ATT&CK procedure.               
 
----
+  `--campaign Cxxxx`   Auto-mark techniques used in a  `--campaign C0017`
+                       campaign.                       
 
-## 📁 Output Structure
+  `--mark-all all`     Mark all techniques as          `--mark-all all`
+                       relevant.                       
 
-| File | Description |
-|------|--------------|
-| `/output_YYYY-MM-DD/mitre_tactic_strengths_*.html` | Interactive tactic-level control strength dashboard. |
-| `/output_YYYY-MM-DD/filtered_summary_*.csv` | Weighted summary of control strengths by tactic. |
-| `/output_YYYY-MM-DD/tactic_control_strengths_*.csv` | Diagnostic export of control parameters used in simulation. |
-| `/output_YYYY-MM-DD/cyber_risk_simulation_results_*.csv` | Detailed per-draw results: λ, success chain, annual loss, incidents. |
-| `/output_YYYY-MM-DD/cyber_risk_simulation_summary_*.csv` | Summary metrics including credible intervals for AAL, incident frequency, and SLE. |
-| `/output_YYYY-MM-DD/dashboard_2x2_*.png` | Posterior distributions of λ, success prob., incident count, and annual loss. |
-| `/output_YYYY-MM-DD/ale_log_chart_*.png` | Log-scale histogram of annual loss with percentile markers. |
-| `/output_YYYY-MM-DD/loss_exceedance_curve_*.png` | Log-scale loss exceedance curve (P50, P90, P95, P99 markers). |
+  `--dedupe-names`     Remove duplicate technique      `--dedupe-names`
+                       names within a tactic.          
+  ----------------------------------------------------------------------------
 
----
+------------------------------------------------------------------------
+
+### `mitre_control_strength_dashboard.py`
+
+  --------------------------------------------------------------------------------------------------------------------------
+  Option                    Description                     Example
+  ------------------------- ------------------------------- ----------------------------------------------------------------
+  `--dataset PATH`          MITRE ATT&CK JSON dataset.      `--dataset enterprise-attack.json`
+
+  `--strengths PATH`        Mitigation control strength     `--strengths mitigation_control_strengths.csv`
+                            CSV.                            
+
+  `--use-relevance`         Enables filtering by relevance  `--use-relevance`
+                            CSV.                            
+
+  `--relevance-file PATH`   Alternate relevance file path.  `--relevance-file ./output_2025-11-05/technique_relevance.csv`
+
+  `--no-figure`             Suppress chart generation.      `--no-figure`
+
+  `--show-figure`           Automatically open the          `--show-figure`
+                            generated HTML dashboard.       
+  --------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+### `cyber_incident_pymc.py`
+
+  --------------------------------------------------------------------------------------------------------
+  Option                        Description                     Example
+  ----------------------------- ------------------------------- ------------------------------------------
+  `--dataset PATH`              MITRE ATT&CK JSON path.         `--dataset enterprise-attack.json`
+
+  `--csv PATH`                  Control strength CSV.           `--csv mitigation_control_strengths.csv`
+
+  `--no-adapt-stochastic`       Disables stochastic             `--no-adapt-stochastic`
+                                adaptability (fixed learning).  
+
+  `--no-stochastic-impact`      Use mean values for impact      `--no-stochastic-impact`
+                                reduction controls.             
+
+  `--print-control-strengths`   Prints/exports per-tactic       `--print-control-strengths`
+                                control parameter table.        
+
+  `--no-plot`                   Headless mode (saves figures    `--no-plot`
+                                only).                          
+  --------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+## 📁 Output File Summary
+
+  ---------------------------------------------------------------------------------------------
+  File                                        Description
+  ------------------------------------------- -------------------------------------------------
+  **`mitigation_influence_template.csv`**     Seed file listing each ATT&CK mitigation, its
+                                              coverage, and default control strength range.
+
+  **`technique_relevance.csv`**               Tactic--technique matrix allowing marking of
+                                              relevant items per campaign or procedure.
+
+  **`filtered_summary_*.csv`**                Weighted tactic-level control strength summary
+                                              (from dashboard).
+
+  **`mitre_tactic_strengths_*.html`**         Interactive HTML visualization of control
+                                              strengths.
+
+  **`tactic_control_strengths_*.csv`**        Diagnostic export of per-tactic control
+                                              parameters used in simulation.
+
+  **`cyber_risk_simulation_results_*.csv`**   Detailed posterior results (λ, success
+                                              probability, annual losses, etc.).
+
+  **`cyber_risk_simulation_summary_*.csv`**   Summary of AAL, credible intervals, incident
+                                              frequency, and SLE.
+
+  **`dashboard_2x2_*.png`**                   Posterior distributions (λ, success probability,
+                                              incidents, losses).
+
+  **`ale_log_chart_*.png`**                   Log-scale Annual Loss histogram with percentile
+                                              markers.
+
+  **`loss_exceedance_curve_*.png`**           Log-scale loss exceedance curve (P50, P90, P95,
+                                              P99).
+  ---------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------
 
 ## 🧮 Model Highlights
 
-- **Subset-aware modeling** – Only tactics and mitigations marked as relevant are modeled.  
-- **Threat capability** – Randomized per attacker, controlling base success probability.  
-- **Adaptability** – Logistic update per retry, simulating learning during repeated attempts.  
-- **Detection and fallback** – Attack chains can reset to prior stages, realistically extending attack paths.  
-- **Impact reduction controls** – “Data Backup” and “Encrypt Sensitive Information” dynamically reduce losses when in scope.  
-- **FAIR-aligned losses** – Category-level lognormal distributions with Pareto tails for Legal and Reputation losses.  
-- **Comprehensive summary output** – AAL, SLE, credible intervals, and validation of `AAL ≈ Frequency × SLE`.  
-- **Visualization suite** – Auto-generated dashboard, ALE log histogram, and loss exceedance curve.
+-   **Subset-aware simulation:** only includes tactics/techniques marked
+    as relevant.\
+-   **Threat capability:** randomizes per-attacker success scaling.\
+-   **Adaptability:** logistic per-retry learning curve for adaptive
+    attackers.\
+-   **Detection/fallback:** simulates realistic defensive
+    re-engagement.\
+-   **Impact mitigation:** Backup and Encryption dynamically reduce
+    modeled losses.\
+-   **FAIR-aligned losses:** multi-category lognormal + Pareto-tails for
+    extreme events.\
+-   **Outputs credible intervals** for AAL, incidents/year, and
+    loss-per-incident.\
+-   **Validates AAL ≈ Frequency × SLE.**
 
----
+------------------------------------------------------------------------
 
 ## 🧠 Recommended Practices
 
-1. **Calibrate**: Review control strength ranges periodically using subject-matter input.  
-2. **Scope Carefully**: Use `build_technique_relevance_template.py` to focus analysis on specific threat campaigns.  
-3. **Validate Results**: Compare AAL and SLE to real or benchmark incident cost data.  
-4. **Sensitivity Testing**: Run variations with different adaptability ranges or fallback probabilities.  
-5. **Version Control**: Keep generated CSVs and evidence JSONs under source control for reproducibility.  
+1.  **Calibrate control strengths:** refine
+    `mitigation_influence_template.csv` with SME input.\
+2.  **Scope the analysis:** use the relevance CSV to align with specific
+    campaigns or actors.\
+3.  **Run sensitivity analysis:** vary adaptability, fallback, and
+    detection parameters.\
+4.  **Compare benchmarks:** validate AAL/SLE outputs against internal
+    loss data or peer estimates.\
+5.  **Version outputs:** retain daily `/output_YYYY-MM-DD/` folders for
+    reproducibility and audit trail.
 
----
+------------------------------------------------------------------------
 
-© 2025 — Quantitative Cyber Risk Analysis Framework (FAIR + MITRE ATT&CK)
+© 2025 --- FAIR--MITRE ATT&CK Quantitative Cyber Risk Framework\
+Author: *Joshua M. Connors*\
+License: *Open Use for Non-Commercial Research and Risk Analysis*
