@@ -9,7 +9,7 @@ It leverages:
 - **Bayesian inference (PyMC)** and **Monte Carlo simulation** for uncertainty propagation.  
 - A complete data pipeline from ATT&CK → control strengths → simulated loss distributions.  
 
-For a more detailed explanation of the scripts and the various design diecisions and variables see this [Wiki article](https://github.com/joshua-m-connors/cyber-incident-mcmc-pymc/wiki/FAIR-%E2%80%90-MITRE-ATT&CK-Model-Deep-Dive).
+For those interested in a deeper understanding of the model and to see what I have done to put it into action see this [Wiki article](https://github.com/joshua-m-connors/cyber-incident-mcmc-pymc/wiki/FAIR-%E2%80%90-MITRE-ATT&CK-Model-Deep-Dive).
 
 ---
 
