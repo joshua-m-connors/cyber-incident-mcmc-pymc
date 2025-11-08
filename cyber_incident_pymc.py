@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # Copyright (C) 2025 Joshua Connors
+# License: Open Use for Non-Commercial Research and Risk Analysis
 """
 =====================================================================================
 Cyber Incident Risk Model with MITRE ATT&CK + FAIR (Subset-Aware, Impact-Reduced)
