@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # Copyright (C) 2025 Joshua Connors
+# License: Open Use for Non-Commercial Research and Risk Analysis
 """
 =====================================================================================
 MITRE ATT&CK Mitigation Influence Template Builder (Instructional Version)
