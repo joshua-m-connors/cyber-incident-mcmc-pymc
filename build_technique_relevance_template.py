@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# Copyright (C) 2025 Joshua Connors
 """
 Build technique_relevance.csv from the MITRE ATT&CK Enterprise JSON bundle.
 
