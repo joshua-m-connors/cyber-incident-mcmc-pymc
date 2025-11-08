@@ -353,6 +353,7 @@ def _build_beta_priors_from_stage_map(stage_map, tactics_included):
 def _simulate_attacker_path(success_probs, rng):
     """Simulate stagewise progression with retries, detection, and fallbacks.
     Returns True if the final stage is reached (success).
+    a9fbaa806d527ffe1cc1aa3b2a9ba944567a4a60
     Adaptability is drawn stochastically per retry and applied using a logistic-style update."""
     i = 0
     n_stages = len(success_probs)
