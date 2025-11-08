@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# Copyright (C) 2025 Joshua Connors
 """
 MITRE ATT&CK Control Strength Dashboard — Stable Hover Edition
 - Multiline hover via per-point hovertemplate (array of strings)
