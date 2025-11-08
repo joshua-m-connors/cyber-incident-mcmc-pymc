@@ -1,7 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Copyright (C) 2025 Joshua Connors
-# License: Open Use for Non-Commercial Research and Risk Analysis
+#
+# Copyright 2025 Joshua M. Connors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# ---------------------------------------------------------------------------
+# MITRE ATT&CK Mitigation Influence Template Builder
+# ---------------------------------------------------------------------------
+# Constructs a CSV quantifying how each MITRE ATT&CK mitigation influences
+# techniques and tactics — forming the baseline for FAIR–MITRE quantitative
+# risk simulations.
+# ---------------------------------------------------------------------------
 """
 =====================================================================================
 MITRE ATT&CK Mitigation Influence Template Builder (Instructional Version)
