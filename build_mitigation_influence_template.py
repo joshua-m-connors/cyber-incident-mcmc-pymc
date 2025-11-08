@@ -160,6 +160,7 @@ def _build_template(techniques: dict, mitigations: dict, relationships: list[dic
     max_count = max(tech_counts.values()) if tech_counts else 1
 
     # USER TIP: Adjust default_ranges if you want to bias initial control values.
+    # a9fbaa806d527ffe1cc1aa3b2a9ba944567a4a60
     # These are percentage-based placeholders (later capped in dashboards).
     default_ranges = [(30, 70), (35, 65), (40, 60)]
 
