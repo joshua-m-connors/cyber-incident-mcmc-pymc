@@ -250,6 +250,7 @@ def get_mitre_tactic_strengths(dataset_path: str = DATASET_PATH,
     # ---------- Visualization ----------
     if build_figure and not detail_df.empty:
         # Build per-point hovertemplate strings (fully formatted; no HTML containers)
+        # a9fbaa806d527ffe1cc1aa3b2a9ba944567a4a60
         hover_templates = []
         for _, row in detail_df.iterrows():
             lines = row["MitigationLines"]
