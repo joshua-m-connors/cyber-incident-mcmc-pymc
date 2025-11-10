@@ -207,6 +207,8 @@ Outputs:
 
 ---
 
-© 2025 — FAIR–MITRE ATT&CK Quantitative Cyber Risk Framework  
-Author: *Joshua M. Connors*  
-License: *Open Use for Non-Commercial Research and Risk Analysis*  
+FAIR–MITRE ATT&CK Quantitative Cyber Risk Framework
+Copyright 2025 Joshua M. Connors
+
+Licensed under the Apache License, Version 2.0.
+This software incorporates public data from the MITRE ATT&CK® framework.
