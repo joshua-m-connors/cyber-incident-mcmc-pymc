@@ -11,6 +11,8 @@ It leverages:
 
 For those interested in a deeper understanding of the model and to see what I have done to put it into action (think Agentic AI) see this [Wiki article](https://github.com/joshua-m-connors/cyber-incident-mcmc-pymc/wiki/FAIR-%E2%80%90-MITRE-ATT&CK-Model-Deep-Dive).
 
+If you are interested in an implementation using R see this repository: https://github.com/joshua-m-connors/cyber-incident-mcmc-cmdstanr
+
 ---
 
 ## 🧭 Framework Overview
