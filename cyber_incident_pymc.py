@@ -99,6 +99,13 @@ CI_MAX_FREQ = 24
 Z_90 = 1.645
 
 # =============================================================================
+# Variables: Threat capability (higher = stronger attacker)
+# =============================================================================
+# Threat capability modifies per-stage success probabilities during simulation.
+THREAT_CAPABILITY_STOCHASTIC = True
+THREAT_CAPABILITY_RANGE = (0.4, 0.90)   # higher = more capable attacker
+
+# =============================================================================
 # Variables: PyMC sampling controls
 # =============================================================================
 # These control the Markov Chain Monte Carlo (MCMC) sampling process.
@@ -119,18 +126,12 @@ MAX_RETRIES_PER_STAGE = 3
 RETRY_PENALTY = 0.90
 FALLBACK_PROB = 0.25
 DETECT_BASE = 0.01
-DETECT_INC_PER_RETRY = 0.03
+DETECT_INC_MIN = 0.01
+DETECT_INC_MAX = 0.05
 MAX_FALLBACKS_PER_CHAIN = 3
 
 # Visualization Option: plot monetary values in millions
 PLOT_IN_MILLIONS = True
-
-# =============================================================================
-# Variables: Threat capability (higher = stronger attacker)
-# =============================================================================
-# Threat capability modifies per-stage success probabilities during simulation.
-THREAT_CAPABILITY_STOCHASTIC = True
-THREAT_CAPABILITY_RANGE = (0.4, 0.90)   # higher = more capable attacker
 
 # =============================================================================
 # Variables: Adaptability (stochastic per retry) — logistic update mode
@@ -370,48 +371,84 @@ def _build_beta_priors_from_stage_map(stage_map, tactics_included):
     return np.array(alphas), np.array(betas)
 
 def _simulate_attacker_path(success_probs, rng):
-    """Simulate stagewise progression with retries, detection, and fallbacks.
-    Returns True if the final stage is reached (success).
-    a9fbaa806d527ffe1cc1aa3b2a9ba944567a4a60
-    Adaptability is drawn stochastically per retry and applied using a logistic-style update."""
+    """
+    Simulate stage-by-stage attacker progression with retries, detection checks,
+    adaptability adjustments, and fallbacks.
+
+    This version is identical to the original except that the detection
+    probability increase per retry is no longer static. Instead it is sampled
+    from DETECT_INC_MIN to DETECT_INC_MAX once per retry attempt.
+
+    Parameters
+    ----------
+    success_probs : list of float
+        Probability of attacker success for each stage. These values must already
+        include any control-strength adjustments or dependency effects.
+    rng : numpy.random.Generator
+        Random generator supplied by the calling simulation.
+
+    Returns
+    -------
+    bool
+        True if the attacker completes the final stage.
+        False if the attacker stalls, is detected, or exhausts retries.
+    """
+
     i = 0
     n_stages = len(success_probs)
     fallback_count = 0
+
+    # No stages means automatic failure.
     if n_stages == 0:
         return False
 
     while 0 <= i < n_stages:
-        p_nominal = float(success_probs[i])
+        p_current = float(success_probs[i])
         detect_prob = DETECT_BASE
 
+        # Attempt retries for this stage
         for _ in range(MAX_RETRIES_PER_STAGE):
-            if rng.random() < p_nominal:
+
+            # Try stage
+            if rng.random() < p_current:
+                # Success, move to next stage
                 i += 1
                 break
-            detect_prob = min(1.0, detect_prob + DETECT_INC_PER_RETRY)
+
+            # Failure: increase detection probability by a sampled increment
+            delta = float(rng.uniform(DETECT_INC_MIN, DETECT_INC_MAX))
+            detect_prob = min(1.0, detect_prob + delta)
+
+            # Check if detected
             if rng.random() < detect_prob:
                 return False
 
-            # Draw adaptability per retry (stochastic)
+            # Adaptability adjustment (unchanged)
             if ADAPTABILITY_STOCHASTIC:
-                adapt = float(rng.uniform(*ADAPTABILITY_RANGE))
+                adapt_factor = float(rng.uniform(*ADAPTABILITY_RANGE))
             else:
-                adapt = float(np.mean(ADAPTABILITY_RANGE))
+                adapt_factor = float(sum(ADAPTABILITY_RANGE) / 2.0)
 
-            # Apply logistic-style update to moderate the effect of adaptability
             if ADAPTABILITY_MODE == "logistic":
-                delta = adapt * (1.0 - p_nominal) * p_nominal
+                change = adapt_factor * (1.0 - p_current) * p_current
             else:
-                delta = (adapt * ADAPTABILITY_EFFECT_SCALE) * (1.0 - p_nominal)
-            p_nominal = np.clip(p_nominal + delta, 0.0, 1.0)
+                change = (adapt_factor * ADAPTABILITY_EFFECT_SCALE) * (1.0 - p_current)
+
+            p_current = max(0.0, min(1.0, p_current + change))
+
         else:
-            if rng.random() < FALLBACK_PROB and fallback_count < MAX_FALLBACKS_PER_CHAIN:
+            # Retries exhausted: fallback attempt
+            if (
+                rng.random() < FALLBACK_PROB and
+                fallback_count < MAX_FALLBACKS_PER_CHAIN
+            ):
                 fallback_count += 1
-                i = max(0, i - 1)
+                i = max(0, i - 1)  # step back one stage
                 continue
             else:
                 return False
 
+    # Success if we exit past the final stage
     return i >= n_stages
 
 def _sample_posterior_lambda_and_success(alphas: np.ndarray, betas: np.ndarray, n_stages: int):

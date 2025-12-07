@@ -1,26 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-#
-# Copyright 2025 Joshua M. Connors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# ---------------------------------------------------------------------------
-# MITRE ATT&CK Control Strength Dashboard
-# ---------------------------------------------------------------------------
-# Aggregates mitigation-level strengths into tactic-level weighted ranges
-# and produces an interactive Plotly dashboard used by the FAIR–MITRE model.
-# ---------------------------------------------------------------------------
 """
 MITRE ATT&CK Control Strength Dashboard — Stable Hover Edition
 - Multiline hover via per-point hovertemplate (array of strings)
@@ -122,6 +101,204 @@ def load_relevance_filter(file_path: str):
     kept[tactic_col] = kept[tactic_col].astype(str).str.strip()
     kept[tech_col] = kept[tech_col].astype(str).str.strip()
     return set(kept[tech_col].dropna().unique()), set(kept[tactic_col].dropna().unique())
+
+
+def _compute_effective_mitigation_strengths(csv: pd.DataFrame, seed: int | None = None) -> Dict[str, Tuple[float, float]]:
+    """Compute dependency- and group-adjusted mitigation strengths.
+
+    Returns a mapping from Mitigation_ID (lowercased) to an effective
+    (Control_Min, Control_Max) pair in PERCENT (0–100), after applying:
+      • Dependency_Group health ranges (Group_Health_Min/Max in [0..1])
+      • Requires lists (space-separated Mitigation_IDs)
+      • Requires_Influence_Min/Max (in [0..1])
+
+    If the dependency columns are not present, this falls back to the
+    baseline Control_Min/Control_Max mapping for backward compatibility.
+    """
+    import random
+
+    # Ensure required base columns exist
+    required = {"Mitigation_ID", "Control_Min", "Control_Max"}
+    if not required.issubset(csv.columns):
+        raise ValueError("CSV missing required columns for mitigation strengths.")
+
+    dep_cols = {
+        "Dependency_Group", "Group_Health_Min", "Group_Health_Max",
+        "Requires", "Requires_Influence_Min", "Requires_Influence_Max",
+        "Control_Type",
+    }
+
+    # If dependency columns are absent, behave like the original simple map
+    if not dep_cols.issubset(csv.columns):
+        strengths: Dict[str, Tuple[float, float]] = {}
+        for mid, lo, hi in zip(csv["Mitigation_ID"], csv["Control_Min"], csv["Control_Max"]):
+            try:
+                strengths[str(mid).strip().lower()] = (float(lo), float(hi))
+            except Exception:
+                continue
+        return strengths
+
+    # Optionally re-seed for reproducible group/influence sampling
+    if seed is not None:
+        random.seed(seed)
+
+    # Build node structures keyed by Mitigation_ID (normalized)
+    nodes: Dict[str, Dict[str, object]] = {}
+    for _, row in csv.iterrows():
+        mid = str(row["Mitigation_ID"]).strip().lower()
+        if not mid:
+            continue
+        try:
+            cmin = float(row["Control_Min"])
+            cmax = float(row["Control_Max"])
+        except Exception:
+            continue
+
+        ctrl_type = str(row.get("Control_Type", "MITRE") or "MITRE").strip().upper()
+        dep_group = str(row.get("Dependency_Group", "") or "").strip()
+
+        # Group health in [0..1] (optional)
+        try:
+            gh_min = float(row.get("Group_Health_Min"))
+        except Exception:
+            gh_min = None
+        try:
+            gh_max = float(row.get("Group_Health_Max"))
+        except Exception:
+            gh_max = None
+
+        # Requires: space-separated Mitigation_ID values
+        req_raw = str(row.get("Requires", "") or "").strip()
+        requires = [r.strip().lower() for r in req_raw.split() if r.strip()] if req_raw else []
+
+        # Influence in [0..1] (optional)
+        try:
+            inf_min = float(row.get("Requires_Influence_Min"))
+        except Exception:
+            inf_min = None
+        try:
+            inf_max = float(row.get("Requires_Influence_Max"))
+        except Exception:
+            inf_max = None
+
+        nodes[mid] = {
+            "id": mid,
+            "control_min": cmin,
+            "control_max": cmax,
+            "type": ctrl_type,
+            "group": dep_group,
+            "gh_min": gh_min,
+            "gh_max": gh_max,
+            "requires": requires,
+            "inf_min": inf_min,
+            "inf_max": inf_max,
+        }
+
+    # Sample a single health factor per dependency group (if configured)
+    group_health: Dict[str, float] = {}
+    for node in nodes.values():
+        g = node["group"]
+        if not g:
+            continue
+        if g not in group_health:
+            gh_min = node["gh_min"]
+            gh_max = node["gh_max"]
+            if gh_min is None or gh_max is None:
+                group_health[g] = 1.0
+            else:
+                lo = max(0.0, min(1.0, float(gh_min)))
+                hi = max(0.0, min(1.0, float(gh_max)))
+                if hi < lo:
+                    lo, hi = hi, lo
+                val = lo if hi == lo else random.uniform(lo, hi)
+                group_health[g] = val
+
+    eff_cache: Dict[str, Tuple[float, float]] = {}
+    k_samples: Dict[str, float] = {}
+    visiting: Set[str] = set()
+
+    def resolve(mid: str) -> Tuple[float, float]:
+        """Resolve the effective (min,max) strength for a single control."""
+        mid_norm = str(mid).strip().lower()
+        if mid_norm in eff_cache:
+            return eff_cache[mid_norm]
+
+        node = nodes.get(mid_norm)
+        if node is None:
+            # Unknown ID referenced as dependency: treat as neutral (no change)
+            eff = (50.0, 70.0)
+            eff_cache[mid_norm] = eff
+            return eff
+
+        if mid_norm in visiting:
+            # Cycle detected: fall back to group-adjusted baseline only
+            base_min = float(node["control_min"])
+            base_max = float(node["control_max"])
+            g = node["group"]
+            gf = group_health.get(g, 1.0)
+            eff = (base_min * gf, base_max * gf)
+            eff_cache[mid_norm] = eff
+            return eff
+
+        visiting.add(mid_norm)
+
+        base_min = float(node["control_min"])
+        base_max = float(node["control_max"])
+        g = node["group"]
+        gf = group_health.get(g, 1.0)
+        base_min *= gf
+        base_max *= gf
+
+        requires = node["requires"]
+        if not requires:
+            eff = (base_min, base_max)
+            eff_cache[mid_norm] = eff
+            visiting.remove(mid_norm)
+            return eff
+
+        # Aggregate upstream dependency strength D in [0..1] using the
+        # most conservative (minimum) of the upstream effective ranges.
+        d_norm = 1.0
+        for rid in requires:
+            rmin, rmax = resolve(rid)
+            r_norm = max(0.0, min(1.0, min(rmin, rmax) / 100.0))
+            d_norm = min(d_norm, r_norm)
+
+        # Sample or retrieve influence weight k in [0..1]
+        if mid_norm not in k_samples:
+            inf_min = node["inf_min"]
+            inf_max = node["inf_max"]
+            if inf_min is None or inf_max is None:
+                k = 1.0
+            else:
+                lo = max(0.0, min(1.0, float(inf_min)))
+                hi = max(0.0, min(1.0, float(inf_max)))
+                if hi < lo:
+                    lo, hi = hi, lo
+                k = lo if hi == lo else random.uniform(lo, hi)
+            k_samples[mid_norm] = k
+        else:
+            k = k_samples[mid_norm]
+
+        base_min_n = max(0.0, min(1.0, base_min / 100.0))
+        base_max_n = max(0.0, min(1.0, base_max / 100.0))
+        eff_min_n = base_min_n * ((1.0 - k) + k * d_norm)
+        eff_max_n = base_max_n * ((1.0 - k) + k * d_norm)
+        eff_min = eff_min_n * 100.0
+        eff_max = eff_max_n * 100.0
+        if eff_min > eff_max:
+            eff_min, eff_max = eff_max, eff_min
+
+        eff = (eff_min, eff_max)
+        eff_cache[mid_norm] = eff
+        visiting.remove(mid_norm)
+        return eff
+
+    strengths: Dict[str, Tuple[float, float]] = {}
+    for mid in nodes.keys():
+        strengths[mid] = resolve(mid)
+
+    return strengths
 
 def compute_tactic_strengths(tactic_map, mitigations, strengths_map, discount_controls=None):
     discount_controls = discount_controls or []
@@ -228,15 +405,13 @@ def get_mitre_tactic_strengths(dataset_path: str = DATASET_PATH,
 
     try:
         csv = pd.read_csv(csv_path)
-        csv["Mitigation_ID"] = csv["Mitigation_ID"].astype(str).str.strip().str.lower()
-        csv_map = {mid: (float(lo), float(hi))
-                   for mid, lo, hi in zip(csv["Mitigation_ID"], csv["Control_Min"], csv["Control_Max"])}
-        log(f"✅ Loaded {len(csv_map)} mitigation strengths.", quiet)
+        strengths_map = _compute_effective_mitigation_strengths(csv, seed=seed)
+        log(f"✅ Loaded {len(strengths_map)} mitigation strengths.", quiet)
     except Exception as e:
         log(f"⚠️ Could not load strengths ({e}) — defaulting to 30–70%.", quiet)
-        csv_map = {}
+        strengths_map = {}
 
-    detail_df, summary_df = compute_tactic_strengths(tactic_map, mitigations, csv_map, DISCOUNT_CONTROLS)
+    detail_df, summary_df = compute_tactic_strengths(tactic_map, mitigations, strengths_map, DISCOUNT_CONTROLS)
 
     # impact-reduction controls
     impact_reduction_controls = {}
@@ -246,7 +421,7 @@ def get_mitre_tactic_strengths(dataset_path: str = DATASET_PATH,
             ext_id = next((r.get("external_id", "").strip().lower()
                            for r in mit.get("external_references", [])
                            if r.get("source_name") == "mitre-attack"), None)
-            lo, hi = csv_map.get(ext_id) or (30.0, 70.0)
+            lo, hi = strengths_map.get(ext_id) or (30.0, 70.0)
             impact_reduction_controls[mit["name"]] = {
                 "min_strength": lo,
                 "max_strength": hi,
@@ -269,7 +444,6 @@ def get_mitre_tactic_strengths(dataset_path: str = DATASET_PATH,
     # ---------- Visualization ----------
     if build_figure and not detail_df.empty:
         # Build per-point hovertemplate strings (fully formatted; no HTML containers)
-        # a9fbaa806d527ffe1cc1aa3b2a9ba944567a4a60
         hover_templates = []
         for _, row in detail_df.iterrows():
             lines = row["MitigationLines"]
@@ -311,7 +485,7 @@ def get_mitre_tactic_strengths(dataset_path: str = DATASET_PATH,
             template="plotly_white",
             height=650,
             hovermode="x unified",
-            hoverlabel=dict(namelength=-1, font_size=11)  # keep labels compact
+            hoverlabel=dict(namelength=-1, font_size=11)
         )
         html_path = os.path.join(OUTPUT_DIR, f"mitre_tactic_strengths_{ts}.html")
         fig.write_html(html_path)
@@ -325,14 +499,12 @@ def get_mitre_tactic_strengths(dataset_path: str = DATASET_PATH,
     summary_out.to_csv(out_csv, index=False)
     log(f"✅ Summary CSV saved → {out_csv}", quiet)
 
-    # --- Apply approved gating logic for impact reduction controls ---
-    # Encryption mitigation only applies if Exfiltration tactic is in scope
+    # --- Apply gating logic for impact reduction controls ---
     if 'Exfiltration' not in summary_df['Tactic'].values and 'Encrypt Sensitive Information' in impact_reduction_controls:
         impact_reduction_controls['Encrypt Sensitive Information']['min_strength'] = 0.0
         impact_reduction_controls['Encrypt Sensitive Information']['max_strength'] = 0.0
         impact_reduction_controls['Encrypt Sensitive Information']['mean_strength'] = 0.0
 
-    # Data Backup mitigation only applies if one or more in-scope Impact techniques map to Data Backup
     has_backup_in_impact = False
     try:
         impact_rows = detail_df[detail_df['Tactic'] == 'Impact']

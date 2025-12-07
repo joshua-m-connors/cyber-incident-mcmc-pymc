@@ -1,32 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-#
-# Copyright 2025 Joshua M. Connors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# ---------------------------------------------------------------------------
-# MITRE ATT&CK Mitigation Influence Template Builder
-# ---------------------------------------------------------------------------
-# Constructs a CSV quantifying how each MITRE ATT&CK mitigation influences
-# techniques and tactics — forming the baseline for FAIR–MITRE quantitative
-# risk simulations.
-# ---------------------------------------------------------------------------
 """
 =====================================================================================
 MITRE ATT&CK Mitigation Influence Template Builder (Instructional Version)
 =====================================================================================
-This script constructs a structured CSV file (`mitigation_influence_template.csv`) that
+This script constructs a structured CSV file (`mitigation_control_strengths.csv`) that
 quantifies how each MITRE ATT&CK mitigation influences techniques and tactics. It is
 intended to help analysts understand how mitigations map to ATT&CK data, and to seed
 control strength modeling in later FAIR–MITRE ATT&CK quantitative risk simulations.
@@ -49,20 +27,21 @@ KEY TASKS PERFORMED BY THIS SCRIPT
 HOW TO USE / MODIFY
 --------------------------------------------
 - Ensure `enterprise-attack.json` (MITRE ATT&CK bundle) is in the same directory.
-- Run this script directly to produce `mitigation_influence_template.csv`.
+- Run this script directly to produce `mitigation_control_strengths.csv`.
 - The default output directory for logs is auto-created as `output_YYYY-MM-DD/`.
 
 --------------------------------------------
 USER-TUNABLE PARAMETERS
 --------------------------------------------
 - `default_ranges`: Default min/max control strength seeds (in percent).
-  Adjust if you want a wider or narrower spread of initial strengths.
-- Random seed (set via `random.seed(42)`) controls deterministic behavior.
+- Analysts can later edit the generated CSV to:
+  • Override Control_Min / Control_Max.
+  • Add more nuanced dependency and group health information for the model.
 
 --------------------------------------------
 OUTPUT FILES
 --------------------------------------------
-- `mitigation_influence_template.csv` : Generated CSV for downstream modeling.
+- `mitigation_control_strengths.csv` : Generated CSV for downstream modeling.
 - `mitigation_template_build_log_<timestamp>.txt` : Basic log of build results.
 =====================================================================================
 """
@@ -73,116 +52,142 @@ import random
 import pandas as pd
 from datetime import datetime
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ANSI color codes for pretty console output (optional aesthetic only)
-GREEN  = "\033[92m"
+# ─────────────────────────────
+# Simple ANSI color helpers
+# ─────────────────────────────
+GREEN = "\033[92m"
 YELLOW = "\033[93m"
-RED    = "\033[91m"
-BLUE   = "\033[94m"
-CYAN   = "\033[96m"
-RESET  = "\033[0m"
+RED = "\033[91m"
+RESET = "\033[0m"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Output directory setup
-# This creates a date-labeled folder for log/report output, ensuring results
-# stay organized by execution date.
+# ─────────────────────────────
+# Paths and defaults
+# ─────────────────────────────
+DATASET_PATH = "enterprise-attack.json"
+
 def make_output_dir(prefix: str = "output") -> str:
-    """Create (if needed) and return the output directory path."""
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    timestamp = datetime.now().strftime("%Y-%m-%d")
-    out_dir = os.path.join(base_dir, f"{prefix}_{timestamp}")
-    os.makedirs(out_dir, exist_ok=True)
-    print(f"{GREEN}📁 Output directory:{RESET} {out_dir}")
-    return out_dir
+    """Create daily output directory."""
+    base = os.getcwd()
+    today = datetime.now().strftime("%Y-%m-%d")
+    out = os.path.join(base, f"{prefix}_{today}")
+    os.makedirs(out, exist_ok=True)
+    return out
 
 OUTPUT_DIR = make_output_dir("output")
 
 # CSV output is placed in the base folder (not output dir) since users will
 # typically open and edit it for calibration.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-OUT_CSV  = os.path.join(BASE_DIR, "mitigation_influence_template.csv")
+OUT_CSV  = os.path.join(BASE_DIR, "mitigation_control_strengths.csv")
 
 # ──────────────────────────────────────────────────────────────────────────────
 def _load_stix_objects(dataset_path: str):
-    """Load the MITRE ATT&CK STIX bundle and return parsed objects.
-
-    Args:
-        dataset_path (str): Path to ATT&CK JSON file (e.g., enterprise-attack.json).
+    """
+    Load STIX objects from a MITRE ATT&CK bundle.
 
     Returns:
-        tuple(dict, dict, list):
-            - techniques: dict of attack-pattern objects
-            - mitigations: dict of course-of-action objects
-            - relationships: list of mitigation relationships
+      techniques: dict[id -> attack-pattern object]
+      mitigations: dict[id -> course-of-action object]
+      relationships: list[relationship objects of type "mitigates"]
     """
     with open(dataset_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # STIX bundles typically contain an "objects" list
-    objs = data["objects"] if isinstance(data, dict) and "objects" in data else data
+    techniques = {}
+    mitigations = {}
+    relationships = []
 
-    # Separate by object type
-    techniques    = {o["id"]: o for o in objs if o.get("type") == "attack-pattern"}
-    mitigations   = {o["id"]: o for o in objs if o.get("type") == "course-of-action"}
-    relationships = [
-        o for o in objs
-        if o.get("type") == "relationship" and o.get("relationship_type") == "mitigates"
-    ]
+    for obj in data.get("objects", []):
+        t = obj.get("type")
+        if t == "attack-pattern":
+            techniques[obj["id"]] = obj
+        elif t == "course-of-action":
+            mitigations[obj["id"]] = obj
+        elif t == "relationship" and obj.get("relationship_type") == "mitigates":
+            relationships.append(obj)
 
-    print(f"{GREEN}✅ Loaded {len(mitigations)} mitigations from dataset{RESET}")
     return techniques, mitigations, relationships
 
-# ──────────────────────────────────────────────────────────────────────────────
-def _mitigation_external_id(mobj: dict) -> str | None:
-    """Extract the mitigation’s external MITRE ID (e.g., M1031)."""
-    for r in mobj.get("external_references", []) or []:
-        ext = r.get("external_id", "")
-        if isinstance(ext, str) and ext.startswith("M"):
-            return ext
-    return None
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Random seed ensures reproducibility of random range selections.
-random.seed(42)
-
-def _build_template(techniques: dict, mitigations: dict, relationships: list[dict]) -> pd.DataFrame:
-    """Constructs the mitigation influence template.
-
-    Steps:
-      1. Map each mitigation to the techniques it mitigates.
-      2. Map each technique to its associated MITRE tactics.
-      3. Count techniques and tactics per mitigation.
-      4. Compute normalized weights (based on relative technique coverage).
-      5. Assign randomized default control strength ranges.
-
-    Returns:
-        pd.DataFrame: Mitigation influence template ready for CSV export.
+def _technique_tactics_map(techniques: dict) -> dict:
     """
-
-    # Build mapping: mitigation → techniques
-    from collections import defaultdict
-    mit_to_techs = defaultdict(set)
-    for rel in relationships:
-        src, tgt = rel.get("source_ref", ""), rel.get("target_ref", "")
-        if src.startswith("course-of-action") and tgt.startswith("attack-pattern"):
-            mit_to_techs[src].add(tgt)
-
-    # Build mapping: technique → tactics (phases)
-    tech_to_tactics: dict[str, set[str]] = {}
+    Build a mapping: technique_id -> set of tactics (strings).
+    """
+    tech_to_tactics = {}
     for tid, tobj in techniques.items():
-        phases = tobj.get("kill_chain_phases", []) or []
-        tactics = [p.get("phase_name", "").replace("-", " ").title()
-                   for p in phases if p.get("phase_name")]
-        tech_to_tactics[tid] = set(tactics)
+        phases = tobj.get("kill_chain_phases", [])
+        tactic_names = set()
+        for ref in phases:
+            tactic = ref.get("phase_name", "").replace("-", " ").title()
+            if tactic:
+                tactic_names.add(tactic)
+        tech_to_tactics[tid] = tactic_names
+    return tech_to_tactics
 
-    # Count techniques per mitigation to normalize influence weights
-    tech_counts = {mid: len(ts) for mid, ts in mit_to_techs.items()}
-    max_count = max(tech_counts.values()) if tech_counts else 1
+def _mitigation_technique_map(relationships: list) -> dict:
+    """
+    Build a mapping: mitigation_id -> set of technique_ids mitigated.
+    """
+    mit_to_techs = {}
+    for rel in relationships:
+        src = rel.get("source_ref")
+        tgt = rel.get("target_ref")
+        if not src or not tgt:
+            continue
+        mit_to_techs.setdefault(src, set()).add(tgt)
+    return mit_to_techs
 
-    # USER TIP: Adjust default_ranges if you want to bias initial control values.
-    # a9fbaa806d527ffe1cc1aa3b2a9ba944567a4a60
-    # These are percentage-based placeholders (later capped in dashboards).
-    default_ranges = [(30, 70), (35, 65), (40, 60)]
+def _mitigation_external_id(mit_obj: dict) -> str:
+    """
+    Extract MITRE external_id (like 'M1047') from a mitigation object.
+    Returns an empty string if not found.
+    """
+    for ref in mit_obj.get("external_references", []):
+        if ref.get("source_name") == "mitre-attack":
+            return ref.get("external_id", "").strip()
+    return ""
+
+# ──────────────────────────────────────────────────────────────────────────────
+def build_mitigation_template(dataset_path: str = DATASET_PATH) -> None:
+    """
+    Build the mitigation influence template and write to CSV.
+
+    The CSV will include:
+      - Mitigation_ID
+      - Mitigation_Name
+      - Techniques_Mitigated
+      - Tactics_Covered
+      - Weight
+      - Control_Min, Control_Max
+      - Control_Type (MITRE vs SUPPORT)
+      - Dependency_Group, Group_Health_Min, Group_Health_Max
+      - Requires, Requires_Influence_Min, Requires_Influence_Max
+    """
+    print(f"{GREEN}Loading ATT&CK dataset:{RESET} {dataset_path}")
+
+    techniques, mitigations, relationships = _load_stix_objects(dataset_path)
+    tech_to_tactics = _technique_tactics_map(techniques)
+    mit_to_techs = _mitigation_technique_map(relationships)
+
+    print(f"{GREEN}Techniques loaded:{RESET}   {len(techniques)}")
+    print(f"{GREEN}Mitigations loaded:{RESET}  {len(mitigations)}")
+    print(f"{GREEN}Relationships loaded:{RESET} {len(relationships)}")
+
+    # Default control strength ranges (in percent) used as seed values
+    default_ranges = [
+        (30, 60),
+        (40, 70),
+        (50, 80),
+    ]
+
+    # Compute a simple influence metric: number of techniques mitigated
+    max_count = 0
+    for mid in mitigations.keys():
+        linked_techs = mit_to_techs.get(mid, set())
+        if len(linked_techs) > max_count:
+            max_count = len(linked_techs)
+
+    if max_count == 0:
+        max_count = 1  # avoid divide-by-zero
 
     rows = []
     for mid, mobj in mitigations.items():
@@ -222,49 +227,51 @@ def _build_template(techniques: dict, mitigations: dict, relationships: list[dic
             "Weight": weight,
             "Control_Min": lo,
             "Control_Max": hi,
+            # New dependency-related fields (analyst-editable in the CSV)
+            # Control_Type: "MITRE" for native ATT&CK mitigations, "SUPPORT" for non-MITRE / governance controls
+            "Control_Type": "MITRE",
+            # Dependency_Group: optional logical stack name (e.g., "IAM_Stack1"); blank means no grouping
+            "Dependency_Group": "",
+            # Group_Health_Min/Max: optional group health range in [0..1]; blank means neutral health (1.0)
+            "Group_Health_Min": "",
+            "Group_Health_Max": "",
+            # Requires: optional space-separated list of Mitigation_ID values this control depends on
+            "Requires": "",
+            # Requires_Influence_Min/Max: optional influence weight range in [0..1]; blank → full dependence (1.0)
+            "Requires_Influence_Min": "",
+            "Requires_Influence_Max": "",
         })
 
     # Convert list to DataFrame and sort by influence metrics
     df = pd.DataFrame(rows)
     if not df.empty:
-        df.sort_values(by=["Weight", "Techniques_Mitigated", "Tactics_Covered"],
-                       ascending=[False, False, False], inplace=True)
+        df.sort_values(by=["Weight", "Techniques_Mitigated"], ascending=[False, False], inplace=True)
         df.reset_index(drop=True, inplace=True)
-    return df
+
+    # Write CSV
+    df.to_csv(OUT_CSV, index=False)
+    print(f"{GREEN}Template CSV written to:{RESET} {OUT_CSV}")
+
+    # Write a simple build log
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_path = os.path.join(OUTPUT_DIR, f"mitigation_template_build_log_{ts}.txt")
+    with open(log_path, "w", encoding="utf-8") as rep:
+        rep.write("MITRE ATT&CK Mitigation Influence Template Build Log\n")
+        rep.write("===================================================\n\n")
+        rep.write(f"Dataset: {dataset_path}\n")
+        rep.write(f"Timestamp: {ts}\n\n")
+        rep.write(f"Techniques: {len(techniques)}\n")
+        rep.write(f"Mitigations: {len(mitigations)}\n")
+        rep.write(f"Mitigation relationships: {len(relationships)}\n")
+        rep.write(f"Template saved: {OUT_CSV}\n")
+    print(f"{GREEN}📝 Log saved to:{RESET} {log_path}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
-    """Main execution: load dataset, compute template, and save results."""
-    DATASET_PATH = "enterprise-attack.json"
-
     try:
-        # Load data and build influence matrix
-        techniques, mitigations, relationships = _load_stix_objects(DATASET_PATH)
-        df = _build_template(techniques, mitigations, relationships)
-
-        if df.empty:
-            print(f"{YELLOW}⚠️ No mitigations available to write. Check dataset/filters.{RESET}")
-        else:
-            # Save to CSV (editable template)
-            df.to_csv(OUT_CSV, index=False)
-            print(f"{GREEN}✅ Saved {len(df)} mitigations to:{RESET} {OUT_CSV}")
-            print(f"{BLUE}📊 Weight range:{RESET} {df['Weight'].min():.3f} → {df['Weight'].max():.3f}")
-            print(f"{CYAN}🏆 Top mitigation:{RESET} {df.iloc[0]['Mitigation_ID']} ({df.iloc[0]['Weight']:.3f})  "
-                  f"— Lowest: {df.iloc[-1]['Mitigation_ID']} ({df.iloc[-1]['Weight']:.3f})")
-
-        # Save basic log file summarizing build run
-        log_path = os.path.join(
-            OUTPUT_DIR, f"mitigation_template_build_log_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
-        )
-        with open(log_path, "w", encoding="utf-8") as rep:
-            rep.write(f"MITRE dataset: {DATASET_PATH}\n")
-            rep.write(f"Mitigations loaded: {len(mitigations)}\n")
-            rep.write(f"Mitigation relationships: {len(relationships)}\n")
-            rep.write(f"Template saved: {OUT_CSV}\n")
-        print(f"{GREEN}📝 Log saved to:{RESET} {log_path}")
-
-    except FileNotFoundError as e:
-        print(f"{RED}❌ File not found:{RESET} {e}")
+        build_mitigation_template(DATASET_PATH)
+    except FileNotFoundError:
+        print(f"{RED}❌ Could not find dataset file:{RESET} {DATASET_PATH}")
     except json.JSONDecodeError as e:
         print(f"{RED}❌ JSON parse error in dataset:{RESET} {e}")
     except Exception as e:
