@@ -316,8 +316,13 @@ def _print_stage_control_map(stage_map, tactics_included):
 
 def _success_interval_from_control(block_lo: float, block_hi: float):
     """
-    Convert control block interval (fraction) → attacker success interval.
-    success = 1 - block
+    Convert control block interval (fraction) to a susceptibility interval.
+
+    Here:
+      - block_lo, block_hi are control strengths (block probabilities) in [0..0.95]
+      - we compute an interval for attacker SUCCESS after controls but
+        before Threat Capability is applied:
+          success = 1 - block
     """
     block_lo = max(0.0, min(0.95, block_lo))
     block_hi = max(0.0, min(0.95, block_hi))
@@ -559,8 +564,12 @@ def _simulate_annual_losses(lambda_draws, succ_chain_draws, succ_mat,
             else:
                 stage_success_probs = rng.beta(alphas, betas).astype(float)
 
-        # Apply baseline Threat Capability to stage success probabilities (higher tc => higher chance to succeed)
-        stage_success_probs = np.clip(stage_success_probs + tc * (1.0 - stage_success_probs), 0.0, 1.0)
+        # Apply Threat Capability as a FAIR style ceiling:
+        #   vulnerability v_stage = tc * susceptibility_stage
+        # This guarantees:
+        #   - v_stage <= tc for every stage
+        #   - stronger controls (lower susceptibility) reduce v_stage
+        stage_success_probs = np.clip(tc * stage_success_probs, 0.0, 1.0)
 
         # Simulate progression
         if _simulate_attacker_path(stage_success_probs, rng):
